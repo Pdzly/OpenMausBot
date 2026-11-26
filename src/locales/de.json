@@ -4648,5 +4648,6 @@
   "settings.botTasks.outbound": "Auf GitHub posten",
   "settings.botTasks.outboundLine": "Kommentare auf verknüpften Pull-Requests und Issues erlauben. Sie sind öffentlich, und du bestätigst jeden einzeln.",
   "settings.botTasks.merge": "Mergen erlauben",
-  "settings.botTasks.mergeLine": "Beim Posten anbieten, einen verknüpften Pull-Request zu mergen."
+  "settings.botTasks.mergeLine": "Beim Posten anbieten, einen verknüpften Pull-Request zu mergen.",
+  "common.saving": "Wird gespeichert…"
 }
