@@ -9,6 +9,8 @@ import { EFFORT_LEVELS } from "../../shared/wire.ts";
 import { DEFAULT_WINDOW_MINUTES } from "../cache-keepwarm.ts";
 import { botsTowardLimit } from "../../shared/bot-limit.ts";
 import { parseSocks5Proxy } from "../browser/egress/policy.ts";
+import { BOT_TASKS_POLL_MINUTES, REPO_PATTERN } from "../../shared/bot-tasks.ts";
+import { botTasksSettings } from "../bot-tasks/settings.ts";
 import { CONFIG_PATCH_FIELDS as F, MAX_THREAD_EVENT_LOG_BYTES, MIN_THREAD_EVENT_LOG_BYTES } from "../config.ts";
 import { display, withoutKeys, type RegistryDeps, type SettingEntry, type Where, type WritableSpec } from "./registry.ts";
 
@@ -99,6 +101,18 @@ export function configEntries(deps: Pick<RegistryDeps, "cfg" | "saveConfig" | "b
       synonyms: ["keep warm", "cache", "prompt cache"], value: F.cacheKeepWarm.unwrap(), allowed: '{"enabled":true|false,"windowMinutes"?:15-1440}',
       current: () => cfg().cacheKeepWarm ?? { enabled: false }, patch: (cacheKeepWarm) => ({ cacheKeepWarm }),
       says: ({ enabled, windowMinutes }) => (enabled ? `Keep prompt caches warm for ${windowMinutes ?? DEFAULT_WINDOW_MINUTES} minutes after each turn (spends tokens)` : "Stop keeping prompt caches warm"),
+    }),
+    // Security: what lets a bot act on GitHub (the two outbound switches and the credential) is the person's own, in bots.githubAccess.
+    section({
+      id: "botTasks.tasks", label: "Bot tasks", help: "The shared task list bots keep: whether it is on, GitHub polling, which repositories may be read, and whether done needs evidence.", where: "page:bot-tasks",
+      synonyms: ["tasks", "task list", "bot tasks", "evidence", "github sync", "poll", "repositories", "allowlist"],
+      value: nonEmpty(z.object({
+        enabled: z.boolean().optional(), githubSync: z.boolean().optional(), pollMinutes: z.number().int().min(BOT_TASKS_POLL_MINUTES.min).max(BOT_TASKS_POLL_MINUTES.max).optional(),
+        repos: z.array(z.string().trim().regex(REPO_PATTERN)).max(200).optional(), requireEvidenceForDone: z.boolean().optional(), requireEvidenceForReview: z.boolean().optional(),
+      }).strict()),
+      allowed: `{"enabled"?,"githubSync"?,"pollMinutes"?:${BOT_TASKS_POLL_MINUTES.min}-${BOT_TASKS_POLL_MINUTES.max},"repos"?:["owner/repo"],"requireEvidenceForDone"?,"requireEvidenceForReview"?}`,
+      current: () => { const { allowOutboundComments: _comments, allowMerge: _merge, credential: _credential, ...shown } = botTasksSettings(cfg()); return shown; }, patch: (botTasks) => ({ botTasks }),
+      says: (botTasks) => `Bot tasks: ${fields(botTasks)}`,
     }),
     feature("bots.skillAuthoring", "Bots write their own skills", "Bots may draft skills for your review.", "early", ["skills", "write skills", "early", "experimental"], "skillAuthoring", true,
       "Let bots draft skills for your review", "Stop bots drafting skills"),

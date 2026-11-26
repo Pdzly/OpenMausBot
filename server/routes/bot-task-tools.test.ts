@@ -178,10 +178,10 @@ describe("the app's task routes", () => {
     const a = tasks.create({ title: "Scanner", ownerBotId: "lin", by: { kind: "bot", id: "lin", name: "Lin" }, github: "Pdzly/OpenMausBot#5" }).task;
     tasks.create({ title: "Page", ownerBotId: "pixel", by: { kind: "bot", id: "pixel", name: "Pixel" } });
     const all = await call(route, "GET", "/api/bot-tasks");
-    expect((all as { body: { tasks: unknown[] } }).body.tasks).toHaveLength(2);
-    expect(((await call(route, "GET", "/api/bot-tasks?bot=lin&repo=pdzly/openmausbot&status=open&q=scan")) as { body: { tasks: Array<{ id: string }> } }).body.tasks.map((task) => task.id)).toEqual([a.id]);
+    expect((all as unknown as { body: { tasks: unknown[] } }).body.tasks).toHaveLength(2);
+    expect(((await call(route, "GET", "/api/bot-tasks?bot=lin&repo=pdzly/openmausbot&status=open&q=scan")) as unknown as { body: { tasks: Array<{ id: string }> } }).body.tasks.map((task) => task.id)).toEqual([a.id]);
     expect(await call(route, "GET", "/api/bot-tasks?status=nope")).toMatchObject({ status: 400 });
-    const one = (await call(route, "GET", `/api/bot-tasks/${a.id}`)) as { body: { task: { id: string }; ownerName: string } };
+    const one = (await call(route, "GET", `/api/bot-tasks/${a.id}`)) as unknown as { body: { task: { id: string }; ownerName: string } };
     expect(one.body.ownerName).toBe("Lin");
     expect(one.body.task.id).toBe(a.id);
     expect(await call(route, "GET", "/api/bot-tasks/tsk_missing")).toMatchObject({ status: 404 });
@@ -192,7 +192,7 @@ describe("the app's task routes", () => {
     settings = { ...settings, githubSync: false };
     const { route, tasks } = routes();
     const id = tasks.create({ title: "x", ownerBotId: "lin", by: { kind: "bot", id: "lin", name: "Lin" }, github: "Pdzly/OpenMausBot#5" }).task.id;
-    const synced = (await call(route, "POST", `/api/bot-tasks/${id}/sync`)) as { status: number; body: { ok: boolean; task: { activity: unknown[] } } };
+    const synced = (await call(route, "POST", `/api/bot-tasks/${id}/sync`)) as unknown as { status: number; body: { ok: boolean; task: { activity: unknown[] } } };
     expect(synced.status).toBe(200);
     expect(synced.body.task.activity.length).toBeGreaterThan(2);
   });
@@ -203,7 +203,7 @@ describe("the app's task routes", () => {
     expect(await call(route, "POST", `/api/bot-tasks/${id}/post`, { text: "hello" }, admin)).toMatchObject({ status: 403 });
     settings = { ...settings, allowOutboundComments: true };
     expect(await call(route, "POST", `/api/bot-tasks/${id}/post`, { text: "hello", extra: 1 }, admin)).toMatchObject({ status: 400 });
-    const posted = (await call(route, "POST", `/api/bot-tasks/${id}/post`, { text: "hello" }, admin)) as { status: number; body: { url: string; task: { activity: Array<{ type: string; by: unknown }> } } };
+    const posted = (await call(route, "POST", `/api/bot-tasks/${id}/post`, { text: "hello" }, admin)) as unknown as { status: number; body: { url: string; task: { activity: Array<{ type: string; by: unknown }> } } };
     expect(posted.status).toBe(200);
     expect(posted.body.task.activity.at(-1)).toMatchObject({ type: "posted", by: { kind: "person", name: "Philipp" } });
     expect(github.postComment).toHaveBeenCalledTimes(1);
