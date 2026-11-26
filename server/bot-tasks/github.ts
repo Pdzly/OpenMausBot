@@ -1,0 +1,340 @@
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { BOT_TASK_LIMITS, REPO_PATTERN, type BotTaskGithubRef } from "../../shared/bot-tasks.ts";
+
+const API = "https://api.github.com";
+const MARKER_PREFIX = "<!-- omb-bot-task:";
+const TOKEN_TTL = 60_000;
+const execFileAsync = promisify(execFile);
+type Exec = (file: string, args: string[], options: { timeout: number; encoding: "utf8" }) => Promise<{ stdout: string }>;
+const ghTokens = new WeakMap<Exec, { pending: Promise<string | null>; expiresAt: number }>();
+
+export async function resolveGithubToken(
+  source: "gh" | "token",
+  saved: string | undefined,
+  { exec = execFileAsync }: { exec?: Exec } = {},
+): Promise<string | null> {
+  if (source === "token") return saved?.trim() || null;
+  const cached = ghTokens.get(exec);
+  if (cached && cached.expiresAt > Date.now()) return cached.pending;
+  const entry = {
+    pending: Promise.resolve()
+      .then(() => exec("gh", ["auth", "token"], { timeout: 5000, encoding: "utf8" }))
+      .then(({ stdout }) => stdout.trim() || null, () => null)
+      .finally(() => { entry.expiresAt = Date.now() + TOKEN_TTL; }),
+    expiresAt: Infinity,
+  };
+  ghTokens.set(exec, entry);
+  return entry.pending;
+}
+
+export function redactToken(text: string, token?: string | null): string {
+  return (token ? text.replaceAll(token, "[REDACTED]") : text)
+    .replace(/\b(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+)\b/g, "[REDACTED]");
+}
+
+export class GithubError extends Error {
+  readonly status?: number;
+  readonly resetAt?: number;
+
+  constructor(message: string, status?: number, resetAt?: number, token?: string | null) {
+    super(redactToken(message, token));
+    this.name = "GithubError";
+    this.status = status;
+    this.resetAt = resetAt;
+  }
+}
+
+type GithubState = "open" | "closed" | "merged";
+type StateChange = "merged" | "closed" | "reopened";
+type EventBase = { key: string; at: number; login: string; ownMarker?: boolean; url: string };
+
+export type GithubEvent = EventBase & (
+  | { type: "comment"; text: string }
+  | { type: "review"; state: string; text: string }
+  | { type: "check"; name: string; conclusion: string }
+  | { type: "state"; state: StateChange }
+);
+
+export interface GithubItem {
+  kind: "pull" | "issue";
+  state: GithubState;
+  mergeable: boolean | null;
+  headSha: string | null;
+  htmlUrl: string;
+  title: string;
+  closedAt?: string;
+  mergedAt?: string;
+  mergedBy?: string;
+}
+
+type GithubUser = { login?: string } | null;
+type PullResponse = {
+  state: "open" | "closed";
+  merged?: boolean;
+  mergeable?: boolean | null;
+  head?: { sha: string };
+  html_url: string;
+  title: string;
+  closed_at?: string | null;
+  merged_at?: string | null;
+  merged_by?: GithubUser;
+};
+type Comment = { id: number; user?: GithubUser; body?: string | null; created_at: string; html_url: string };
+type Review = Omit<Comment, "created_at"> & { submitted_at?: string; state: string };
+type Check = {
+  name: string; status: string; conclusion: string | null; completed_at: string | null;
+  app?: { slug?: string } | null; html_url: string;
+};
+type Status = {
+  context: string; state: string; created_at: string; updated_at?: string; creator?: GithubUser; target_url?: string | null;
+};
+type IssueEvent = { event: string; actor?: GithubUser; created_at: string };
+
+export function ownCommentMarker(taskId: string): string {
+  if (!/^[a-zA-Z0-9_]+(?:-[a-zA-Z0-9_]+)*$/.test(taskId)) throw new GithubError("Invalid bot task ID");
+  return `${MARKER_PREFIX}${taskId} -->`;
+}
+
+function repoPath(repo: string, number: number): string {
+  if (!REPO_PATTERN.test(repo) || repo.split("/").some((part) => part === "." || part === "..")) {
+    throw new GithubError("Invalid GitHub repository");
+  }
+  if (!Number.isSafeInteger(number) || number < 1) throw new GithubError("Invalid GitHub issue or pull request number");
+  return `/repos/${repo}`;
+}
+
+function rateLimitReset(headers: Headers, now: () => number): number | undefined {
+  const retry = headers.get("retry-after");
+  const reset = headers.get("x-ratelimit-reset");
+  if (retry && /^\d+$/.test(retry)) return now() + Number(retry) * 1000;
+  if (retry && Number.isFinite(Date.parse(retry))) return Date.parse(retry);
+  if (reset && /^\d+$/.test(reset)) return Number(reset) * 1000;
+}
+
+function nextPage(headers: Headers, current: URL): URL | undefined {
+  const link = headers.get("link")?.match(/<([^>]+)>;\s*rel="next"/)?.[1];
+  if (!link) return;
+  let next: URL;
+  try {
+    next = new URL(link, current);
+  } catch {
+    return;
+  }
+  if (next.origin !== API || next.username || next.password || !next.search || next.search === current.search) return;
+  // GitHub pagination may use /repositories/{id} instead of /repos/{owner}/{repo}.
+  const page = new URL(current);
+  for (const [name, value] of next.searchParams) page.searchParams.set(name, value);
+  if (page.href !== current.href) return page;
+}
+
+export function createGithubClient({
+  token,
+  fetch: fetchImpl = fetch,
+  now = Date.now,
+}: {
+  token: () => Promise<string | null>;
+  fetch?: typeof fetch;
+  now?: () => number;
+}) {
+  async function request<T>(
+    url: string | URL,
+    method = "GET",
+    body?: object,
+    sanitize?: (data: T, credential: string) => T,
+  ): Promise<{ data: T; headers: Headers }> {
+    let credential: string | null;
+    try {
+      credential = await token();
+    } catch {
+      throw new GithubError("GitHub token missing or invalid", 401);
+    }
+    if (!credential) throw new GithubError("GitHub token missing or invalid", 401);
+    let response: Response;
+    try {
+      response = await fetchImpl(new URL(url, API), {
+        method,
+        headers: {
+          Authorization: `Bearer ${credential}`,
+          Accept: "application/vnd.github+json",
+          "X-GitHub-Api-Version": "2022-11-28",
+          "User-Agent": "openmausbot-bot-tasks",
+          ...(body === undefined ? {} : { "Content-Type": "application/json" }),
+        },
+        body: body === undefined ? undefined : JSON.stringify(body),
+        signal: AbortSignal.timeout(15_000),
+        redirect: "error",
+      });
+    } catch {
+      throw new GithubError("GitHub network request failed", undefined, undefined, credential);
+    }
+    const { headers, status } = response;
+    if (!response.ok) {
+      if (status === 403 || status === 429) {
+        const resetAt = rateLimitReset(headers, now);
+        const details = status === 403
+          ? await response.json().catch(() => null) as { message?: unknown } | null
+          : null;
+        if (status === 429) await response.body?.cancel().catch(() => {});
+        const remaining = headers.get("x-ratelimit-remaining");
+        const limited = status === 429 || headers.has("retry-after") || remaining === "0" ||
+          (remaining === null && resetAt !== undefined) ||
+          (typeof details?.message === "string" && /rate limit/i.test(details.message));
+        throw new GithubError(limited ? "GitHub rate limit exceeded" : "GitHub access forbidden", status, limited ? resetAt : undefined);
+      }
+      await response.body?.cancel().catch(() => {});
+      if (status === 401) throw new GithubError("GitHub token missing or invalid", status);
+      if (status === 404) throw new GithubError("GitHub resource not found", status);
+      throw new GithubError(`GitHub request failed (HTTP ${status})`, status);
+    }
+    try {
+      const data = await response.json() as T;
+      return { data: sanitize ? sanitize(data, credential) : data, headers };
+    } catch {
+      throw new GithubError("GitHub returned an unreadable response", status);
+    }
+  }
+
+  async function pages<T, Page = T[]>(path: string, extract: (page: Page) => T[]): Promise<T[]> {
+    let url: URL | undefined = new URL(path, API);
+    url.searchParams.set("per_page", "100");
+    const all: T[] = [];
+    for (let page = 0; url && page < 5; page++) {
+      const result = await request<Page>(url);
+      all.push(...extract(result.data));
+      url = nextPage(result.headers, url);
+    }
+    return all;
+  }
+
+  async function viewer(): Promise<string> {
+    return (await request<{ login: string }>("/user")).data.login;
+  }
+
+  async function pull(repo: string, number: number): Promise<GithubItem> {
+    const path = repoPath(repo, number);
+    let kind: GithubItem["kind"] = "pull";
+    let item: PullResponse;
+    try {
+      item = (await request<PullResponse>(`${path}/pulls/${number}`)).data;
+    } catch (error) {
+      if (!(error instanceof GithubError && error.status === 404)) throw error;
+      kind = "issue";
+      item = (await request<PullResponse>(`${path}/issues/${number}`)).data;
+    }
+    return {
+      kind,
+      state: item.merged ? "merged" : item.state,
+      mergeable: kind === "pull" ? item.mergeable ?? null : null,
+      headSha: kind === "pull" ? item.head?.sha ?? null : null,
+      htmlUrl: item.html_url,
+      title: item.title,
+      closedAt: item.closed_at ?? undefined,
+      mergedAt: item.merged_at ?? undefined,
+      mergedBy: item.merged_by?.login,
+    };
+  }
+
+  async function events(ref: BotTaskGithubRef, sinceMs: number, item?: GithubItem): Promise<GithubEvent[]> {
+    const path = repoPath(ref.repo, ref.number);
+    const issue = `${path}/issues/${ref.number}`;
+    const pr = `${path}/pulls/${ref.number}`;
+    const since = new URLSearchParams({ since: new Date(sinceMs).toISOString() });
+    const snapshot = item ?? await pull(ref.repo, ref.number);
+    const [comments, issueEvents, reviewComments, reviews, checkEvents] = await Promise.all([
+      pages(`${issue}/comments?${since}`, (page: Comment[]) => page),
+      pages(`${issue}/events`, (page: IssueEvent[]) => page),
+      snapshot.kind === "pull" ? pages(`${pr}/comments?${since}`, (page: Comment[]) => page) : [],
+      snapshot.kind === "pull" ? pages(`${pr}/reviews`, (page: Review[]) => page) : [],
+      snapshot.headSha ? checks(path, snapshot.headSha) : [],
+    ]);
+    const activity: GithubEvent[] = [];
+    for (const comment of [...comments, ...reviewComments]) {
+      const at = Date.parse(comment.created_at);
+      if (!Number.isFinite(at) || at < sinceMs) continue;
+      const body = comment.body ?? "";
+      activity.push({
+        type: "comment", key: `comment:${comment.id}`, at, login: comment.user?.login ?? "github",
+        ownMarker: body.includes(MARKER_PREFIX), text: body.slice(0, BOT_TASK_LIMITS.textMax), url: comment.html_url,
+      });
+    }
+    for (const review of reviews) {
+      const at = Date.parse(review.submitted_at ?? "");
+      if (!Number.isFinite(at) || at < sinceMs) continue;
+      activity.push({
+        type: "review", key: `review:${review.id}`, at, login: review.user?.login ?? "github",
+        state: review.state, text: (review.body ?? "").slice(0, BOT_TASK_LIMITS.textMax), url: review.html_url,
+      });
+    }
+    activity.push(...stateEvents(snapshot, issueEvents), ...checkEvents);
+    return activity.sort((a, b) => a.at - b.at);
+  }
+
+  async function checks(path: string, sha: string): Promise<GithubEvent[]> {
+    const commit = `${path}/commits/${encodeURIComponent(sha)}`;
+    const [runs, statuses] = await Promise.all([
+      pages(`${commit}/check-runs?filter=latest`, (page: { check_runs: Check[] }) => page.check_runs),
+      pages(`${commit}/statuses`, (page: Status[]) => page),
+    ]);
+    const latest = new Map<string, GithubEvent>();
+    function record(name: string, conclusion: string, at: number, login: string, url: string) {
+      if (!Number.isFinite(at) || (latest.get(name)?.at ?? -Infinity) >= at) return;
+      latest.set(name, { type: "check", key: `check:${name}:${sha}:${conclusion}`, at, login, name, conclusion, url });
+    }
+    for (const run of runs) {
+      if (run.status === "completed" && run.conclusion) {
+        record(run.name, run.conclusion, Date.parse(run.completed_at ?? ""), run.app?.slug ?? "github", run.html_url);
+      }
+    }
+    for (const status of statuses) {
+      if (status.state !== "pending") {
+        record(status.context, status.state, Date.parse(status.updated_at ?? status.created_at),
+          status.creator?.login ?? "github", status.target_url ?? "");
+      }
+    }
+    return [...latest.values()];
+  }
+
+  async function postComment(ref: BotTaskGithubRef & { taskId: string }, text: string): Promise<{ id: number; url: string }> {
+    const path = repoPath(ref.repo, ref.number);
+    const { data } = await request<{ id: number; html_url: string }>(`${path}/issues/${ref.number}/comments`, "POST", {
+      body: `${text}\n\n${ownCommentMarker(ref.taskId)}`,
+    });
+    return { id: data.id, url: data.html_url };
+  }
+
+  async function merge(
+    ref: BotTaskGithubRef, { method }: { method?: "merge" | "squash" | "rebase" } = {},
+  ): Promise<{ merged: boolean; sha: string; message: string }> {
+    const path = repoPath(ref.repo, ref.number);
+    const { data } = await request<{ merged: boolean; sha: string; message: string }>(
+      `${path}/pulls/${ref.number}/merge`, "PUT", { merge_method: method },
+      ({ merged, sha, message }, credential) => ({ merged, sha, message: redactToken(message, credential) }),
+    );
+    return data;
+  }
+
+  return { viewer, pull, events, postComment, merge };
+}
+
+export type GithubClient = ReturnType<typeof createGithubClient>;
+
+function stateEvents(item: GithubItem, events: IssueEvent[]): GithubEvent[] {
+  const activity: GithubEvent[] = [];
+  const timestamps = new Set<string>();
+  function record(state: StateChange, timestamp: string, login: string) {
+    const at = Date.parse(timestamp);
+    const key = state === "merged" ? "state:merged" : `state:${state}:${state === "closed" ? timestamp : at}`;
+    if (!Number.isFinite(at) || timestamps.has(key)) return;
+    timestamps.add(key);
+    activity.push({ type: "state", state, key, at, login, url: item.htmlUrl });
+  }
+  if (item.mergedAt) record("merged", item.mergedAt, item.mergedBy ?? "github");
+  for (const event of events) {
+    if (event.event === "reopened" || event.event === "closed" || event.event === "merged") {
+      record(event.event, event.created_at, event.actor?.login ?? "github");
+    }
+  }
+  if (item.state === "closed" && item.closedAt) record("closed", item.closedAt, "github");
+  return activity;
+}
