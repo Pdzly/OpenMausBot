@@ -1,5 +1,5 @@
 import {
-  Archive, ArrowLeftRight, Bot, Coins, CreditCard, HardDrive, LockKeyhole, Monitor, Network, Palette, Server, SlidersHorizontal, Sparkles, ToggleRight, Users,
+  Archive, ArrowLeftRight, Bot, Coins, CreditCard, HardDrive, ListTodo, LockKeyhole, Monitor, Network, Palette, Server, SlidersHorizontal, Sparkles, ToggleRight, Users,
   type LucideIcon,
 } from "lucide-react";
 import type { LocaleKey } from "@/locales";
@@ -56,8 +56,8 @@ const adminPage = (ctx: SettingsContext) => !ctx.client && !(ctx.team && !ctx.ad
 const advancedOnly = (when: (ctx: SettingsContext) => boolean) => (ctx: SettingsContext) => ctx.advanced && when(ctx);
 /** Simple mode's eleven entries: the place (Overview, Devices, AI, Vault, Spending, Import & export, Storage on a Cloud,
  * and Features), Your account (Plan & billing) and This app (Appearance). Advanced adds You and your bots, Desktops & browser,
- * Data and General. */
-export const ADVANCED_PAGES: readonly SettingsPageId[] = ["bots", "desktops", "data", "general"];
+ * Data, Bot tasks and General. */
+export const ADVANCED_PAGES: readonly SettingsPageId[] = ["bots", "desktops", "data", "general", "bot-tasks"];
 
 export const SETTINGS_PAGES: readonly SettingsPage[] = [
   { id: "overview", owner: "place", labelKey: "settings.page.overview", synonyms: ["overview", "place", "status", "version", "domain", "address", "sidebar"], when: () => true },
@@ -88,6 +88,8 @@ export const SETTINGS_PAGES: readonly SettingsPage[] = [
     synonyms: ["installations", "fleet", "clients", "tenants"] },
   { id: "features", owner: "place", labelKey: "settings.page.features", icon: ToggleRight, when: adminPage,
     synonyms: ["features", "turn off", "turn on", "hide", "skill burger", "skill burgers", "tabs", "thread tabs"] },
+  { id: "bot-tasks", owner: "place", labelKey: "settings.page.botTasks", icon: ListTodo, when: advancedOnly(adminPage),
+    synonyms: ["bot tasks", "tasks", "task list", "ledger", "github", "pull requests", "issues", "evidence", "sync"] },
   { id: "account", owner: "account", labelKey: "settings.page.account", when: () => true,
     synonyms: ["account", "sign in", "log in", "log out", "sign out", "email", "organization", "mausbot cloud"] },
   { id: "plan", owner: "account", labelKey: "settings.page.plan", icon: CreditCard, when: (ctx) => !ctx.client && ctx.plan,

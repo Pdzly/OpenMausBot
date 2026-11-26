@@ -25,7 +25,7 @@ const PEOPLE = {
 
 describe("the pages", () => {
   it("lists the place's pages, then Your account, then This app, in one fixed order", () => {
-    expect(ids(fullContext())).toEqual([...PLACE_PAGES, "features", "account", "plan", "app", "general", "appearance"]);
+    expect(ids(fullContext())).toEqual([...PLACE_PAGES, "features", "bot-tasks", "account", "plan", "app", "general", "appearance"]);
   });
 
   it.each(Object.entries(PEOPLE))("keeps the same place pages, in the same order, for %s", (who, ctx) => {
