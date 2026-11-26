@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -361,6 +361,7 @@ describe("the log", () => {
   it("starts empty from a damaged file and skips a damaged record", () => {
     writeFileSync(join(dir, BOT_TASKS_FILE), "{ not json");
     expect(make().list()).toEqual([]);
+    expect(readdirSync(dir).filter((name) => name.startsWith(`${BOT_TASKS_FILE}.bad-`))).toHaveLength(1);
     writeFileSync(join(dir, BOT_TASKS_FILE), JSON.stringify({ version: 1, tasks: [{ id: "bad" }, { id: "t1", title: "ok", status: "open", ownerBotId: "lin", createdBy: { kind: "system" }, createdAt: 1, updatedAt: 1, activity: [] }] }));
     expect(make().list().map((task) => task.id)).toEqual(["t1"]);
   });

@@ -1,6 +1,7 @@
 // `bot-tasks.json` in the data folder: the bot tasks. A file that is missing or unreadable is an empty ledger, and a task
-// that does not parse is left out, so one bad record never hides the rest.
-import { mkdirSync, readFileSync } from "node:fs";
+// that does not parse is left out, so one bad record never hides the rest. Whatever is left out stays recoverable: the
+// file is copied to `bot-tasks.json.bad-<time>` before the next write replaces it.
+import { copyFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { z } from "zod";
 
@@ -30,15 +31,30 @@ const taskSchema = z.looseObject({
 });
 const fileSchema = z.object({ version: z.literal(1), tasks: z.array(z.unknown()) });
 
+function keepCopy(file: string): void {
+  try {
+    copyFileSync(file, `${file}.bad-${Date.now()}`);
+  } catch {
+    // The ledger still loads; a copy that cannot be made must not stop the app.
+  }
+}
+
 export function readBotTasksFile(file: string): BotTask[] {
+  if (!existsSync(file)) return [];
   try {
     const parsed = fileSchema.safeParse(JSON.parse(readFileSync(file, "utf8")));
-    if (!parsed.success) return [];
-    return parsed.data.tasks.flatMap((candidate) => {
+    if (!parsed.success) {
+      keepCopy(file);
+      return [];
+    }
+    const tasks = parsed.data.tasks.flatMap((candidate) => {
       const task = taskSchema.safeParse(candidate);
       return task.success ? [task.data as unknown as BotTask] : [];
     });
+    if (tasks.length < parsed.data.tasks.length) keepCopy(file);
+    return tasks;
   } catch {
+    keepCopy(file);
     return [];
   }
 }
