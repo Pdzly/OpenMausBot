@@ -49,6 +49,9 @@ export type BotTaskActivity = {
   | { type: "sync_error"; text: string }
 );
 
+/** An activity entry without its id, time, author and import key: what a caller says happened. */
+export type BotTaskActivityBody = BotTaskActivity extends infer Entry ? (Entry extends unknown ? Omit<Entry, "id" | "at" | "by" | "key"> : never) : never;
+
 export interface BotTask {
   id: string;
   title: string;

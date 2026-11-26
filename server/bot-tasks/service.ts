@@ -1,0 +1,311 @@
+// The bot task ledger: tasks, their append-only log, the evidence rule, inbound GitHub sync and the explicit outbound
+// comment. Storage is `bot-tasks.json`; every change is saved before it is announced to `onChange` listeners.
+import { randomUUID } from "node:crypto";
+import { join } from "node:path";
+
+import {
+  BOT_TASK_LIMITS, type BotTask, type BotTaskActivity, type BotTaskActivityBody, type BotTaskActor, type BotTaskEvidence, type BotTaskGithubRef, type BotTaskStatus,
+  type BotTasksSettings, type BotTaskSummary,
+} from "../../shared/bot-tasks.ts";
+import { redactSecretsInText } from "../../shared/redact.ts";
+import { BotTaskError, githubRefsIn, parseEvidence, parseRef, refLabel, supportsDone } from "./evidence.ts";
+import { repoAllowed } from "./settings.ts";
+import { BOT_TASKS_FILE, readBotTasksFile, writeBotTasksFile } from "./store.ts";
+
+/** An imported GitHub event: the activity payload plus the key that stops a later poll from adding it twice. */
+export type ImportedActivity = { key: string; at: number; by: BotTaskActor } & (
+  | { type: "github_comment"; text: string; url?: string }
+  | { type: "github_review"; state: string; text: string; url?: string }
+  | { type: "github_check"; name: string; conclusion: string; url?: string }
+  | { type: "github_state"; state: "merged" | "closed" | "reopened"; url?: string }
+);
+
+export interface GithubSyncResult {
+  ref: BotTaskGithubRef;
+  githubState: { state: "open" | "closed" | "merged" };
+  activity: ImportedActivity[];
+}
+
+/** What the service needs of GitHub; server/bot-tasks/wiring.ts builds it from the GitHub client. */
+export interface GithubPort {
+  sync(task: BotTask, since: number): Promise<GithubSyncResult>;
+  pull(ref: BotTaskGithubRef): Promise<{ kind: "pull" | "issue"; state: "open" | "closed" | "merged"; mergeable: boolean | null }>;
+  postComment(ref: BotTaskGithubRef, text: string): Promise<{ id: string | number; url: string }>;
+  merge(ref: BotTaskGithubRef): Promise<{ merged: boolean; sha?: string; message?: string }>;
+}
+
+export interface BotTasksDeps {
+  dataDir: string;
+  file?: string;
+  now?: () => number;
+  settings(): BotTasksSettings;
+  botName(botId: string): string | undefined;
+  /** Null when no GitHub credential is usable now. */
+  github(): GithubPort | null;
+  log?(text: string): void;
+}
+
+export interface TaskFilter {
+  status?: BotTaskStatus | readonly BotTaskStatus[];
+  botId?: string;
+  repo?: string;
+  query?: string;
+  limit?: number;
+}
+
+const OPEN_STATUSES: readonly BotTaskStatus[] = ["open", "in_progress", "blocked", "review"];
+const RECENT_DONE_MS = 7 * 24 * 3_600_000;
+const clean = (text: string, max: number) => redactSecretsInText(text).trim().slice(0, max);
+
+export function createBotTasks(deps: BotTasksDeps) {
+  const file = deps.file ?? join(deps.dataDir, BOT_TASKS_FILE);
+  const now = deps.now ?? Date.now;
+  const log = deps.log ?? ((text: string) => console.error(text));
+  let tasks: BotTask[] | null = null;
+  const listeners = new Set<(taskId: string) => void>();
+  const posting = new Set<string>();
+  const syncing = new Set<string>();
+
+  const loaded = (): BotTask[] => (tasks ??= readBotTasksFile(file));
+  const save = (next: BotTask[], changed: readonly string[]) => {
+    writeBotTasksFile(file, next);
+    tasks = next;
+    for (const id of changed) for (const listener of listeners) {
+      try { listener(id); } catch (error) { log(`bot-tasks: a listener failed: ${String(error)}`); }
+    }
+  };
+  const found = (id: string): BotTask => {
+    const task = loaded().find((candidate) => candidate.id === id);
+    if (!task) throw new BotTaskError(404, `No task has the id ${id}. Use task_list for the ids.`);
+    return task;
+  };
+  const activity = (by: BotTaskActor, body: BotTaskActivityBody, at = now(), key?: string): BotTaskActivity =>
+    ({ id: `a_${randomUUID().slice(0, 8)}`, at, by, ...(key ? { key } : {}), ...body }) as BotTaskActivity;
+  const capLog = (entries: BotTaskActivity[]): BotTaskActivity[] => {
+    const over = entries.length - BOT_TASK_LIMITS.activityMax;
+    if (over <= 0) return entries;
+    const imported = entries.filter((entry) => entry.type === "github_comment" || entry.type === "github_check" || entry.type === "github_review" || entry.type === "sync_error");
+    const droppable = new Set<BotTaskActivity>([...imported, ...entries.filter((entry) => entry.type === "comment")].slice(0, over));
+    return entries.filter((entry) => !droppable.has(entry));
+  };
+  /** Replaces one task with the result of `change`; the log gets `added`. */
+  const commit = (id: string, change: (task: BotTask) => BotTask, added: BotTaskActivity[], at = now()): BotTask => {
+    const current = found(id);
+    const next = change({ ...current, activity: current.activity });
+    const updated: BotTask = { ...next, updatedAt: at, activity: capLog([...next.activity, ...added]) };
+    save(loaded().map((task) => (task.id === id ? updated : task)), [id]);
+    return updated;
+  };
+  const summary = (task: BotTask): BotTaskSummary => {
+    const { activity: entries, ...rest } = task;
+    return { ...rest, ownerName: deps.botName(task.ownerBotId) ?? task.ownerBotId, activityCount: entries.length };
+  };
+  const mayChange = (task: BotTask, by: BotTaskActor) => by.kind !== "bot" || by.id === task.ownerBotId || (task.createdBy.kind === "bot" && task.createdBy.id === by.id);
+  const needOwn = (task: BotTask, by: BotTaskActor, what: string) => {
+    if (!mayChange(task, by)) throw new BotTaskError(403, `Only ${deps.botName(task.ownerBotId) ?? "the owner"} or the bot that created this task may ${what}. You can add a comment.`);
+  };
+
+  /** A reference a text names, when it names exactly one and the task has none yet. */
+  const autoRef = (task: BotTask, texts: readonly string[]): { ref?: BotTaskGithubRef; candidates: BotTaskGithubRef[] } => {
+    const candidates = githubRefsIn(texts.join("\n"));
+    return task.github || candidates.length !== 1 ? { candidates: task.github ? [] : candidates } : { ref: candidates[0]!, candidates };
+  };
+  const withRef = (task: BotTask, ref: BotTaskGithubRef, by: BotTaskActor, at: number): { task: BotTask; entry: BotTaskActivity } =>
+    ({ task: { ...task, github: ref }, entry: activity(by, { type: "github_ref", ref }, at) });
+
+  return {
+    onChange(listener: (taskId: string) => void): () => void {
+      listeners.add(listener);
+      return () => { listeners.delete(listener); };
+    },
+
+    create(input: { title: string; ownerBotId: string; by: BotTaskActor; github?: string; text?: string }): { task: BotTask; suggested: BotTaskGithubRef[] } {
+      const title = clean(input.title, BOT_TASK_LIMITS.titleMax).replace(/\s+/g, " ");
+      if (!title) throw new BotTaskError(400, "A task needs a title.");
+      if (!deps.botName(input.ownerBotId)) throw new BotTaskError(400, `No bot has the id ${input.ownerBotId}. Use list_bots for the ids.`);
+      if (loaded().length >= BOT_TASK_LIMITS.tasksMax) throw new BotTaskError(409, `The ledger holds ${BOT_TASK_LIMITS.tasksMax} tasks, the most it may. Cancel or finish some first.`);
+      const at = now();
+      const text = input.text ? clean(input.text, BOT_TASK_LIMITS.textMax) : "";
+      let task: BotTask = { id: `tsk_${randomUUID().replaceAll("-", "").slice(0, 8)}`, title, status: "open", ownerBotId: input.ownerBotId, createdBy: input.by, createdAt: at, updatedAt: at, activity: [] };
+      const added: BotTaskActivity[] = [activity(input.by, { type: "created" }, at)];
+      if (text) added.push(activity(input.by, { type: "comment", text }, at));
+      const explicit = input.github ? parseRef(input.github) : undefined;
+      const { ref, candidates } = explicit ? { ref: explicit, candidates: [] } : autoRef(task, [title, text]);
+      if (ref) {
+        const linked = withRef(task, ref, { kind: "system" }, at);
+        task = linked.task;
+        added.push(linked.entry);
+      }
+      task = { ...task, activity: added };
+      save([...loaded(), task], [task.id]);
+      return { task, suggested: ref ? [] : candidates };
+    },
+
+    comment(id: string, text: string, by: BotTaskActor): { task: BotTask; suggested: BotTaskGithubRef[] } {
+      const body = clean(text, BOT_TASK_LIMITS.textMax);
+      if (!body) throw new BotTaskError(400, "A comment needs text.");
+      const at = now();
+      const before = found(id);
+      const { ref, candidates } = autoRef(before, [body]);
+      const entries = [activity(by, { type: "comment", text: body }, at)];
+      const task = commit(id, (current) => {
+        if (!ref) return current;
+        const linked = withRef(current, ref, { kind: "system" }, at);
+        entries.push(linked.entry);
+        return linked.task;
+      }, entries, at);
+      return { task, suggested: ref ? [] : candidates };
+    },
+
+    setStatus(id: string, input: { status: BotTaskStatus; evidence?: unknown; comment?: string; by: BotTaskActor }): BotTask {
+      const before = found(id);
+      needOwn(before, input.by, "change its status");
+      const settings = deps.settings();
+      const rawEvidence = input.evidence === undefined ? [] : input.evidence;
+      if (!Array.isArray(rawEvidence)) throw new BotTaskError(400, "evidence is a list of items.");
+      if (rawEvidence.length > BOT_TASK_LIMITS.evidencePerMove) throw new BotTaskError(400, `At most ${BOT_TASK_LIMITS.evidencePerMove} evidence items per move.`);
+      const evidence: BotTaskEvidence[] = rawEvidence.map(parseEvidence);
+      const required = (input.status === "done" && settings.requireEvidenceForDone) || (input.status === "review" && settings.requireEvidenceForReview);
+      if (required && !supportsDone(evidence)) {
+        throw new BotTaskError(422, `Moving a task to ${input.status} needs evidence: a commit sha, a CI run URL, a review or comment URL, or a command with the exit code 0. ${evidence.length ? "Only failed commands were given." : "None was given."} Nothing was changed.`);
+      }
+      if (before.status === input.status && !input.comment) throw new BotTaskError(409, `The task is already ${input.status}.`);
+      const at = now();
+      const comment = input.comment ? clean(input.comment, BOT_TASK_LIMITS.textMax) : "";
+      const entries: BotTaskActivity[] = [];
+      if (before.status !== input.status) entries.push(activity(input.by, { type: "status", from: before.status, to: input.status, ...(evidence.length ? { evidence } : {}) }, at));
+      if (comment) entries.push(activity(input.by, { type: "comment", text: comment }, at));
+      const link = autoRef(before, [comment, ...evidence.flatMap((item) => (item.kind === "review_url" || item.kind === "ci_run" ? [item.url] : []))]);
+      return commit(id, (current) => {
+        const moved = { ...current, status: input.status };
+        if (!link.ref) return moved;
+        const linked = withRef(moved, link.ref, { kind: "system" }, at);
+        entries.push(linked.entry);
+        return linked.task;
+      }, entries, at);
+    },
+
+    setOwner(id: string, ownerBotId: string, by: BotTaskActor): BotTask {
+      const before = found(id);
+      needOwn(before, by, "hand it to another bot");
+      if (!deps.botName(ownerBotId)) throw new BotTaskError(400, `No bot has the id ${ownerBotId}. Use list_bots for the ids.`);
+      if (before.ownerBotId === ownerBotId) return before;
+      return commit(id, (current) => ({ ...current, ownerBotId }), [activity(by, { type: "owner", from: before.ownerBotId, to: ownerBotId })]);
+    },
+
+    linkGithub(id: string, rawRef: string, by: BotTaskActor): BotTask {
+      const ref = parseRef(rawRef);
+      const before = found(id);
+      if (before.github && refLabel(before.github).toLowerCase() === refLabel(ref).toLowerCase()) return before;
+      const at = now();
+      return commit(id, (current) => {
+        const { githubState: _old, ...rest } = current;
+        return { ...rest, github: ref };
+      }, [activity(by, { type: "github_ref", ref }, at)], at);
+    },
+
+    list(filter: TaskFilter = {}): BotTaskSummary[] {
+      const statuses = filter.status === undefined ? undefined : new Set(Array.isArray(filter.status) ? filter.status : [filter.status]);
+      const words = filter.query?.toLowerCase().split(/\s+/).filter(Boolean) ?? [];
+      return loaded()
+        .filter((task) => (!statuses || statuses.has(task.status)) && (!filter.botId || task.ownerBotId === filter.botId)
+          && (!filter.repo || task.github?.repo.toLowerCase() === filter.repo.toLowerCase())
+          && words.every((word) => `${task.title} ${task.id} ${task.github ? refLabel(task.github) : ""} ${deps.botName(task.ownerBotId) ?? ""}`.toLowerCase().includes(word)))
+        .sort((a, b) => b.updatedAt - a.updatedAt).slice(0, filter.limit ?? BOT_TASK_LIMITS.tasksMax).map(summary);
+    },
+
+    get(id: string): BotTask & { ownerName: string } {
+      const task = found(id);
+      return { ...task, ownerName: deps.botName(task.ownerBotId) ?? task.ownerBotId };
+    },
+
+    /** Pulls one task's GitHub activity into its log. `force` also works while the polling switch is off. */
+    async sync(id: string, options: { force?: boolean } = {}): Promise<{ added: number; task: BotTask }> {
+      const task = found(id);
+      const settings = deps.settings();
+      if (!task.github) throw new BotTaskError(409, "This task has no GitHub reference. Link one first.");
+      if (!settings.githubSync && !options.force) throw new BotTaskError(403, "GitHub sync is off. Turn it on in Settings → Bot tasks.");
+      if (!repoAllowed(settings, task.github.repo)) throw new BotTaskError(403, `${task.github.repo} is not on the allowed repositories of Settings → Bot tasks, so nothing is read from it.`);
+      const github = deps.github();
+      if (!github) throw new BotTaskError(503, "No GitHub credential is usable. Choose the gh CLI or save a token in Settings → Bot tasks.");
+      if (syncing.has(id)) return { added: 0, task };
+      syncing.add(id);
+      try {
+        const since = task.activity.findLast((entry) => entry.type === "github_ref")?.at ?? task.createdAt;
+        let result: GithubSyncResult;
+        try {
+          result = await github.sync(task, since);
+        } catch (error) {
+          const text = redactSecretsInText(error instanceof Error ? error.message : String(error)).slice(0, 300);
+          const last = found(id).activity.findLast((entry) => entry.type === "sync_error");
+          if (!last || last.type !== "sync_error" || last.text !== text) commit(id, (current) => current, [activity({ kind: "system" }, { type: "sync_error", text })]);
+          throw new BotTaskError(502, `GitHub sync failed: ${text}`);
+        }
+        const at = now();
+        const have = new Set(found(id).activity.flatMap((entry) => (entry.key ? [entry.key] : [])));
+        const fresh = result.activity.filter((entry) => !have.has(entry.key));
+        const entries = fresh.map(({ key, at: when, by, ...body }) => activity(by, body as BotTaskActivityBody, when, key));
+        const updated = commit(id, (current) => ({ ...current, github: result.ref, githubState: { state: result.githubState.state, syncedAt: at } }), entries, entries.length ? at : found(id).updatedAt);
+        return { added: entries.length, task: updated };
+      } finally {
+        syncing.delete(id);
+      }
+    },
+
+    /** One poll round over the tasks with a GitHub reference that are open or lately finished and on an allowed repository. */
+    async syncAll(): Promise<{ checked: number; added: number; errors: number }> {
+      const settings = deps.settings();
+      if (!settings.enabled || !settings.githubSync || !deps.github()) return { checked: 0, added: 0, errors: 0 };
+      const cutoff = now() - RECENT_DONE_MS;
+      const due = loaded().filter((task) => task.github && repoAllowed(settings, task.github.repo) && (OPEN_STATUSES.includes(task.status) || task.updatedAt >= cutoff));
+      const result = { checked: 0, added: 0, errors: 0 };
+      for (const task of due) {
+        result.checked += 1;
+        try {
+          result.added += (await this.sync(task.id)).added;
+        } catch (error) {
+          result.errors += 1;
+          log(`bot-tasks: sync of ${task.id} failed: ${error instanceof Error ? error.message : String(error)}`);
+          if (error instanceof BotTaskError && error.status === 502 && /rate limit/i.test(error.message)) break;
+        }
+      }
+      return result;
+    },
+
+    /** The one outbound path: a comment on the task's pull request or issue, and a merge only when asked. Needs both switches in Settings. */
+    async post(id: string, input: { text: string; merge?: boolean; by: BotTaskActor }): Promise<{ url: string; merged: boolean; task: BotTask }> {
+      const settings = deps.settings();
+      if (!settings.allowOutboundComments) throw new BotTaskError(403, "Posting to GitHub is off. The person turns on 'Allow comments on GitHub' in Settings → Bot tasks; nothing was posted.");
+      if (input.merge && !settings.allowMerge) throw new BotTaskError(403, "Merging is off. The person turns on 'Allow merging' in Settings → Bot tasks; nothing was posted or merged.");
+      const task = found(id);
+      if (!task.github) throw new BotTaskError(409, "This task has no GitHub reference. Link one first.");
+      if (!repoAllowed(settings, task.github.repo)) throw new BotTaskError(403, `${task.github.repo} is not on the allowed repositories of Settings → Bot tasks; nothing was posted.`);
+      const text = clean(input.text, BOT_TASK_LIMITS.textMax);
+      if (!text) throw new BotTaskError(400, "The comment needs text.");
+      const github = deps.github();
+      if (!github) throw new BotTaskError(503, "No GitHub credential is usable. Choose the gh CLI or save a token in Settings → Bot tasks.");
+      if (posting.has(id)) throw new BotTaskError(409, "A post for this task is already running.");
+      posting.add(id);
+      try {
+        const ref = task.github;
+        let merged = false;
+        if (input.merge) {
+          const pull = await github.pull(ref);
+          if (pull.kind !== "pull") throw new BotTaskError(409, `${refLabel(ref)} is an issue, not a pull request: it cannot be merged. Nothing was posted.`);
+          if (pull.state !== "open") throw new BotTaskError(409, `${refLabel(ref)} is already ${pull.state}. Nothing was posted.`);
+          if (pull.mergeable === false) throw new BotTaskError(409, `${refLabel(ref)} is not mergeable now (conflicts or failing required checks). Nothing was posted or merged.`);
+          const result = await github.merge(ref);
+          if (!result.merged) throw new BotTaskError(502, `GitHub did not merge ${refLabel(ref)}: ${redactSecretsInText(result.message ?? "no reason given").slice(0, 200)}. Nothing was posted.`);
+          merged = true;
+        }
+        const posted = await github.postComment(ref, text);
+        const updated = commit(id, (current) => current, [activity(input.by, { type: "posted", url: posted.url, ...(merged ? { merged: true } : {}) }, now(), `comment:${posted.id}`)]);
+        return { url: posted.url, merged, task: updated };
+      } finally {
+        posting.delete(id);
+      }
+    },
+  };
+}
+
+export type BotTasks = ReturnType<typeof createBotTasks>;
