@@ -5,6 +5,7 @@ import { BOT_TASK_STATUSES, type BotTaskSummary } from "../../../shared/bot-task
 import {
   botTasksStatus, filterBotTasks, isBotTaskStatus, loadBotTasks, NO_FILTERS, repoChoices, STATUS_LABEL, type BotTaskFilters, type BotTasksStatus,
 } from "@/lib/bot-tasks";
+import { onBotTaskChanged } from "@/lib/bot-task-events";
 import { t } from "@/lib/i18n";
 import { useStoreDispatch, useStoreSelector } from "@/state/store-select";
 import { Select } from "../Select";
@@ -102,6 +103,8 @@ export function BotTasksView({ settings, bots, onOpenSettings, openId, onOpen }:
     }
   }, []);
   useEffect(() => { void load(query); return () => loading.current?.abort(); }, [load, query]);
+  // Live: any task changing reloads the list with the filters it shows, so a new or moved task appears without a refresh.
+  useEffect(() => onBotTaskChanged(() => void load(query)), [load, query]);
   useEffect(() => {
     if (tasks || failed) { setSlow(false); return; }
     const timer = setTimeout(() => setSlow(true), 300);

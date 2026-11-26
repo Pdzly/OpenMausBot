@@ -4,6 +4,7 @@ import { Loader2, RefreshCw, Send } from "lucide-react";
 import type { BotTask } from "../../../shared/bot-tasks";
 import { BOT_TASK_LIMITS } from "../../../shared/bot-tasks";
 import { githubRefLabel, loadBotTask, postBotTask, syncBotTask, type BotTasksStatus } from "@/lib/bot-tasks";
+import { onBotTaskChanged } from "@/lib/bot-task-events";
 import { t } from "@/lib/i18n";
 import { ConfirmDialog } from "../ConfirmDialog";
 import { BotTaskActivityList } from "./BotTaskActivity";
@@ -57,6 +58,7 @@ export function BotTaskDetail({ id, settings, botName, onChanged }: {
     }
   }, [id]);
   useEffect(() => { void load(); return () => loading.current?.abort(); }, [load]);
+  useEffect(() => onBotTaskChanged((changed) => { if (changed === id) void load(); }), [id, load]);
   const slow = useSlow(!task && !failed);
 
   if (!task) {

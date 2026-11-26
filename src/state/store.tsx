@@ -7,7 +7,7 @@ import { followHeldTails, noteAppPagePatch } from "./held-tails";
 export { MESSAGE_PAGE_SIZE } from "./message-history";
 import { addForkOptimistic, reduceForkPanel, removeForkOptimistic, runForkEffect, type ForkPanelAction, type ForkPanelState } from "./fork-panel";
 import { use, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
-import { createAppStore } from "./app-store"; import { readOneBot } from "./bot-read"; import { sameJson } from "./same-json"; import { forgetSharedSession } from "@/lib/session-reuse"; import { StoreContext, StoreSourceContext } from "./store-context";
+import { createAppStore } from "./app-store"; import { readOneBot } from "./bot-read"; import { sameJson } from "./same-json"; import { forgetSharedSession } from "@/lib/session-reuse"; import { StoreContext, StoreSourceContext } from "./store-context"; import { announceBotTask } from "@/lib/bot-task-events";
 import { flushSync } from "react-dom";
 import type { BotMovedTo, BotVisibility, CardAnswerer, CloudBackend, ConnectorToolGrant, EffortLevel, InstalledPackageMetadata, LiveCallState, ServerFrame, GroupThreadUsage, ResolvedSender, SteerQueueReason, WireBot, WireGroup, WireTask, OptionCardData as WireOptionCard } from "../../shared/wire"; import type { InstanceEndpointInfo } from "../../shared/claude-endpoint";
 import { movesThreadToTop } from "../../shared/wire"; import type { DefaultBotFields } from "../../shared/default-bot";
@@ -3016,13 +3016,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     const stopFrames = store.handleFrames((frame) => { handleFrame(frame); stateRef.current = store.getState(); });
     handleFrame = (frame) => {
       if (frame.kind === "config") bumpPeripheralVersion("config", "instances");
+      else if (frame.kind === "bot-task") announceBotTask(frame.taskId);
       else if (frame.kind === "routine" || frame.kind === "routine.deleted" || frame.kind === "routine.run") {
         bumpPeripheralVersion("routines");
-      } else if (
-        frame.kind === "webhook" ||
-        frame.kind === "webhook.attempt" ||
-        frame.kind === "webhook.deleted"
-      ) {
+      } else if (frame.kind === "webhook" || frame.kind === "webhook.attempt" || frame.kind === "webhook.deleted") {
         bumpPeripheralVersion("webhooks");
       }
       switch (frame.kind) {
