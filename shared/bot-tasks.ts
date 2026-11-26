@@ -98,4 +98,5 @@ export const BOT_TASKS_DEFAULTS: BotTasksSettings = {
 
 export const BOT_TASKS_POLL_MINUTES = { min: 1, max: 1440 } as const;
 
-export const REPO_PATTERN = /^[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}$/;
+/** `owner/repo`; a segment of only dots (`..`) is not a name, so the pattern cannot be used to climb a URL path. */
+export const REPO_PATTERN = /^(?!\.+\/)(?!.*\/\.+$)[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}$/;

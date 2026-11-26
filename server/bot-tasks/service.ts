@@ -26,11 +26,12 @@ export interface GithubSyncResult {
   activity: ImportedActivity[];
 }
 
-/** What the service needs of GitHub; server/bot-tasks/wiring.ts builds it from the GitHub client. */
+/** What the service needs of GitHub; server/bot-tasks/wiring.ts builds it from the GitHub client. `taskId` goes into the
+ * comment as a hidden marker, so a later sync knows the comment is this app's own. */
 export interface GithubPort {
   sync(task: BotTask, since: number): Promise<GithubSyncResult>;
   pull(ref: BotTaskGithubRef): Promise<{ kind: "pull" | "issue"; state: "open" | "closed" | "merged"; mergeable: boolean | null }>;
-  postComment(ref: BotTaskGithubRef, text: string): Promise<{ id: string | number; url: string }>;
+  postComment(ref: BotTaskGithubRef, text: string, taskId: string): Promise<{ id: string | number; url: string }>;
   merge(ref: BotTaskGithubRef): Promise<{ merged: boolean; sha?: string; message?: string }>;
 }
 
@@ -298,7 +299,7 @@ export function createBotTasks(deps: BotTasksDeps) {
           if (!result.merged) throw new BotTaskError(502, `GitHub did not merge ${refLabel(ref)}: ${redactSecretsInText(result.message ?? "no reason given").slice(0, 200)}. Nothing was posted.`);
           merged = true;
         }
-        const posted = await github.postComment(ref, text);
+        const posted = await github.postComment(ref, text, id);
         const updated = commit(id, (current) => current, [activity(input.by, { type: "posted", url: posted.url, ...(merged ? { merged: true } : {}) }, now(), `comment:${posted.id}`)]);
         return { url: posted.url, merged, task: updated };
       } finally {
