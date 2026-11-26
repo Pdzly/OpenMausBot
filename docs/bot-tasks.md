@@ -57,7 +57,7 @@ and reopening need none.
 For tasks with a GitHub ref, the app polls every "Poll interval" minutes (default 5, 1 to 1440) and on demand ("Sync now"
 in the task, or `task_get` with `sync: true`). It appends to the log:
 
-- comments from other people,
+- comments from other people (from the moment the task was linked; earlier discussion is not imported),
 - reviews with their state,
 - CI and check results,
 - merged, closed and reopened events.
@@ -75,7 +75,7 @@ Nothing is attached from a note without the bot's `task_link_github`.
 
 Settings → Bot tasks → GitHub credential:
 
-- **gh CLI** (default): the app runs `gh auth token` and keeps the answer for a minute. Nothing is stored.
+- **gh CLI** (default): the app runs `gh auth token` and keeps the answer for a minute. Nothing is stored. `gh` must be on the server's `PATH` and signed in as the user the server runs as; otherwise a sync records "GitHub token missing or invalid" and the token option is the way out.
 - **Token saved in the app**: a personal access token you paste. It is kept in `config.json` (mode 0600, the same place
   as the app's other secrets), never sent back to the app (Settings only learns that one is set), never shown to bots
   and removed from error messages.
