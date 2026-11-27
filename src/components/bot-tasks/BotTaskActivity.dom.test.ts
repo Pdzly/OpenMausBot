@@ -1,6 +1,6 @@
 // @vitest-environment happy-dom
 // A task's activity as a person reads it: oldest first, proof spelled out, GitHub's part marked, and GitHub's words
-// shown as plain text with links only to github.com.
+// shown as GitHub shows them (sanitized Markdown), with entry links only to github.com.
 import { createElement } from "react";
 import { flushSync } from "react-dom";
 import { createRoot, type Root } from "react-dom/client";
@@ -74,16 +74,72 @@ describe("BotTaskActivityList", () => {
     expect(rows()[1]!.querySelector("a")!.getAttribute("href")).toBe("https://github.com/linx-systems/clamui/pull/12#issuecomment-1");
   });
 
-  it("shows GitHub's words as typed and drops links that leave github.com", () => {
-    const text = '<img src=x onerror="alert(1)"> **bold** [click](javascript:alert(1))';
+  it("drops links that leave github.com", () => {
     render([
-      { id: "1", at: 1, by: { kind: "github", login: "mallory" }, type: "github_comment", text, url: "javascript:alert(1)" },
+      { id: "1", at: 1, by: { kind: "github", login: "mallory" }, type: "github_comment", text: "hi", url: "javascript:alert(1)" },
       { id: "2", at: 2, by: { kind: "github", login: "mallory" }, type: "github_comment", text: "hi", url: "https://github.com.evil.io/x" },
     ]);
-    expect(host.querySelector("img")).toBeNull();
-    expect(host.querySelector("strong")).toBeNull();
-    expect(rows()[0]!.querySelector("p.whitespace-pre-wrap")!.textContent).toBe(text);
     expect(host.querySelectorAll("a")).toHaveLength(0);
+  });
+
+  it("renders GitHub's words as GitHub does: a collapsed <details> that opens, and a GFM table", () => {
+    const text = [
+      "Review notes",
+      "",
+      "<details>",
+      "<summary>Full test log</summary>",
+      "",
+      "```",
+      "ok 1 - parses",
+      "```",
+      "",
+      "</details>",
+      "",
+      "| Check | Result |",
+      "| --- | --- |",
+      "| lint | pass |",
+      "| ~~e2e~~ | skipped |",
+      "",
+      "- [x] typecheck",
+      "- [ ] release",
+    ].join("\n");
+    render([{ id: "1", at: 1, by: { kind: "github", login: "octocat" }, type: "github_comment", text, imported: true }]);
+    const body = rows()[0]!.querySelector("[data-task-markdown]")!;
+    const details = body.querySelector("details")!;
+    expect(details.open).toBe(false);
+    expect(details.querySelector("summary")!.textContent).toBe("Full test log");
+    expect(details.textContent).toContain("ok 1 - parses");
+    details.querySelector("summary")!.click();
+    expect(details.open).toBe(true);
+    expect([...body.querySelectorAll("th")].map((cell) => cell.textContent)).toEqual(["Check", "Result"]);
+    expect([...body.querySelectorAll("td")].map((cell) => cell.textContent)).toEqual(["lint", "pass", "e2e", "skipped"]);
+    expect(body.querySelector("td del")!.textContent).toBe("e2e");
+    expect([...body.querySelectorAll<HTMLInputElement>("input[type=checkbox]")].map((box) => [box.checked, box.disabled])).toEqual([[true, true], [false, true]]);
+  });
+
+  it("strips what GitHub strips: script tags, event handlers and javascript: links", () => {
+    const text = [
+      '<script>window.pwned = 1</script>',
+      '<img src="https://example.com/a.png" alt="shot" onerror="alert(1)">',
+      '<a href="javascript:alert(1)">raw</a> [md](javascript:alert(1)) [ok](https://example.com/docs)',
+      '<iframe src="https://example.com"></iframe><style>body{display:none}</style>',
+      '<details open onclick="alert(1)"><summary onmouseover="alert(1)">More</summary>inside</details>',
+      "**bold**",
+    ].join("\n\n");
+    render([{ id: "1", at: 1, by: { kind: "github", login: "mallory" }, type: "github_comment", text }]);
+    const body = rows()[0]!.querySelector("[data-task-markdown]")!;
+    expect(body.querySelector("script, style, iframe")).toBeNull();
+    expect(body.textContent).not.toContain("window.pwned");
+    expect(body.innerHTML).not.toMatch(/onerror|onclick|onmouseover|javascript:/i);
+    const img = body.querySelector("img")!;
+    expect(img.getAttribute("src")).toBe("https://example.com/a.png");
+    expect(img.getAttribute("alt")).toBe("shot");
+    const links = [...body.querySelectorAll("a")];
+    expect(links.map((link) => link.getAttribute("href"))).toEqual(["https://example.com/docs"]);
+    expect(links[0]!.target).toBe("_blank");
+    expect(links[0]!.rel).toBe("noopener noreferrer");
+    expect(body.querySelector("details")!.open).toBe(true);
+    expect(body.querySelector("strong")!.textContent).toBe("bold");
   });
 
   it("marks history imported from GitHub and shows its original GitHub time as a date, normal entries keep the relative time", () => {

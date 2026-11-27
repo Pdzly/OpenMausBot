@@ -8,6 +8,7 @@ import { cn } from "@/lib/cn";
 import { t } from "@/lib/i18n";
 import type { LocaleKey } from "@/locales";
 import { fullTime, GithubLink, When } from "./parts";
+import { TaskMarkdown } from "./TaskMarkdown";
 
 export function actorName(actor: BotTaskActor): string {
   switch (actor.kind) {
@@ -89,8 +90,8 @@ function EvidenceClaim({ evidence, taskRepo }: { evidence: BotTaskEvidence; task
 }
 
 function Quote({ text }: { text: string }) {
-  // Text from bots and from GitHub is shown as typed: plain text, never markup.
-  return <p dir="auto" className="mt-1 whitespace-pre-wrap break-words rounded-xl border border-hairline/40 px-3 py-2 text-[13px] leading-[18px] text-ink">{text}</p>;
+  // Text from bots and from GitHub reads as it does on GitHub: Markdown plus GitHub's sanitized HTML allowlist.
+  return <TaskMarkdown text={text} className="mt-1 rounded-xl border border-hairline/40 px-3 py-2" />;
 }
 
 function line(entry: BotTaskActivity, who: string, ownerName: (id: string) => string, taskRepo?: string): { text: string; body?: ReactNode; link?: string } {
