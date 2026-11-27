@@ -20,12 +20,23 @@ export interface BotTaskGithubRef {
   kind?: "pull" | "issue";
 }
 
-/** What backs a claim that work is done: one of these is needed to move a task to done (and to review, when that setting is on). */
-export type BotTaskEvidence =
+/** What a caller says backs a claim: one of these is needed to move a task to done (and to review, when that setting is on). */
+export type BotTaskEvidenceClaim =
   | { kind: "commit"; sha: string; repo?: string }
   | { kind: "ci_run"; url: string }
   | { kind: "review_url"; url: string }
   | { kind: "command"; command: string; exitCode: number };
+
+/** What GitHub said when the app looked the claim up. `unverifiable`: no answer was possible (no linked or allowed repository,
+ * no credential, GitHub unreachable, a CI run still going); a `failed` check blocks the move. `detail` is a short plain line. */
+export interface BotTaskVerification {
+  status: "verified" | "failed" | "unverifiable";
+  checkedAt: number;
+  detail?: string;
+}
+
+/** A claim as it is stored: the server adds `verification`; a caller never supplies it. */
+export type BotTaskEvidence = BotTaskEvidenceClaim & { verification?: BotTaskVerification };
 
 export type BotTaskActor = { kind: "bot"; id: string; name: string } | { kind: "person"; name: string } | { kind: "github"; login: string } | { kind: "system" };
 
@@ -35,6 +46,8 @@ export type BotTaskActivity = {
   at: number;
   by: BotTaskActor;
   key?: string;
+  /** From GitHub history older than the link to the task: `at` is the original GitHub time, not the time of the import. */
+  imported?: true;
 } & (
   | { type: "created" }
   | { type: "comment"; text: string }
@@ -50,7 +63,7 @@ export type BotTaskActivity = {
 );
 
 /** An activity entry without its id, time, author and import key: what a caller says happened. */
-export type BotTaskActivityBody = BotTaskActivity extends infer Entry ? (Entry extends unknown ? Omit<Entry, "id" | "at" | "by" | "key"> : never) : never;
+export type BotTaskActivityBody = BotTaskActivity extends infer Entry ? (Entry extends unknown ? Omit<Entry, "id" | "at" | "by" | "key" | "imported"> : never) : never;
 
 export interface BotTask {
   id: string;
@@ -71,13 +84,14 @@ export interface BotTaskSummary extends Omit<BotTask, "activity"> {
   activityCount: number;
 }
 
-/** `botTasks` in config.json, and what Settings shows. The GitHub token is never sent to the app: only `githubTokenSet`. */
+/** `botTasks` in config.json, and what Settings shows. `credential: "vault"` reads a token kept in the Vault (never in config.json);
+ * it is never sent to the app: Settings learns only `githubTokenSet`. */
 export interface BotTasksSettings {
   enabled: boolean;
   githubSync: boolean;
   pollMinutes: number;
   repos: string[];
-  credential: "gh" | "token";
+  credential: "gh" | "vault";
   requireEvidenceForDone: boolean;
   requireEvidenceForReview: boolean;
   allowOutboundComments: boolean;
