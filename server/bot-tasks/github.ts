@@ -4,17 +4,18 @@ import { BOT_TASK_LIMITS, REPO_PATTERN, type BotTaskGithubRef } from "../../shar
 
 const API = "https://api.github.com";
 const MARKER_PREFIX = "<!-- omb-bot-task:";
+const EVIDENCE_TIMEOUT_MS = 4_000;
 const TOKEN_TTL = 60_000;
 const execFileAsync = promisify(execFile);
 type Exec = (file: string, args: string[], options: { timeout: number; encoding: "utf8" }) => Promise<{ stdout: string }>;
 const ghTokens = new WeakMap<Exec, { pending: Promise<string | null>; expiresAt: number }>();
 
 export async function resolveGithubToken(
-  source: "gh" | "token",
-  saved: string | undefined,
+  source: "gh" | "vault",
+  saved: string | null | undefined,
   { exec = execFileAsync }: { exec?: Exec } = {},
 ): Promise<string | null> {
-  if (source === "token") return saved?.trim() || null;
+  if (source === "vault") return saved?.trim() || null;
   const cached = ghTokens.get(exec);
   if (cached && cached.expiresAt > Date.now()) return cached.pending;
   const entry = {
@@ -47,7 +48,7 @@ export class GithubError extends Error {
 
 type GithubState = "open" | "closed" | "merged";
 type StateChange = "merged" | "closed" | "reopened";
-type EventBase = { key: string; at: number; login: string; ownMarker?: boolean; url: string };
+type EventBase = { key: string; legacyKey?: string; at: number; login: string; ownMarker?: boolean; url: string };
 
 export type GithubEvent = EventBase & (
   | { type: "comment"; text: string }
@@ -83,12 +84,13 @@ type PullResponse = {
 type Comment = { id: number; user?: GithubUser; body?: string | null; created_at: string; html_url: string };
 type Review = Omit<Comment, "created_at"> & { submitted_at?: string; state: string };
 type Check = {
-  name: string; status: string; conclusion: string | null; completed_at: string | null;
+  id?: number; name: string; status: string; conclusion: string | null; completed_at: string | null;
   app?: { slug?: string } | null; html_url: string;
 };
 type Status = {
-  context: string; state: string; created_at: string; updated_at?: string; creator?: GithubUser; target_url?: string | null;
+  id?: number; context: string; state: string; created_at: string; creator?: GithubUser; target_url?: string | null;
 };
+type EvidenceResponse = { sha?: string; status?: string; conclusion?: string | null; html_url?: string; run_id?: number };
 type IssueEvent = { event: string; actor?: GithubUser; created_at: string };
 
 export function ownCommentMarker(taskId: string): string {
@@ -112,8 +114,9 @@ function rateLimitReset(headers: Headers, now: () => number): number | undefined
   if (reset && /^\d+$/.test(reset)) return Number(reset) * 1000;
 }
 
-function nextPage(headers: Headers, current: URL): URL | undefined {
-  const link = headers.get("link")?.match(/<([^>]+)>;\s*rel="next"/)?.[1];
+function paginationLink(headers: Headers, current: URL, relation: "next" | "last" | "prev"): URL | undefined {
+  const link = headers.get("link")?.split(/,\s*(?=<)/)
+    .find((part) => part.endsWith(`rel="${relation}"`))?.match(/^\s*<([^>]+)>/)?.[1];
   if (!link) return;
   let next: URL;
   try {
@@ -142,6 +145,7 @@ export function createGithubClient({
     method = "GET",
     body?: object,
     sanitize?: (data: T, credential: string) => T,
+    timeout = 15_000,
   ): Promise<{ data: T; headers: Headers }> {
     let credential: string | null;
     try {
@@ -162,7 +166,7 @@ export function createGithubClient({
           ...(body === undefined ? {} : { "Content-Type": "application/json" }),
         },
         body: body === undefined ? undefined : JSON.stringify(body),
-        signal: AbortSignal.timeout(15_000),
+        signal: AbortSignal.timeout(timeout),
         redirect: "error",
       });
     } catch {
@@ -195,16 +199,22 @@ export function createGithubClient({
     }
   }
 
-  async function pages<T, Page = T[]>(path: string, extract: (page: Page) => T[]): Promise<T[]> {
+  async function pages<T, Page = T[]>(path: string, extract: (page: Page) => T[], newest = false): Promise<T[]> {
     let url: URL | undefined = new URL(path, API);
     url.searchParams.set("per_page", "100");
-    const all: T[] = [];
-    for (let page = 0; url && page < 5; page++) {
-      const result = await request<Page>(url);
-      all.push(...extract(result.data));
-      url = nextPage(result.headers, url);
+    const batches: T[][] = [];
+    let backwards = false;
+    const visited = new Set<string>();
+    for (let page = 0; url && page < 5 && !visited.has(url.href); page++) {
+      visited.add(url.href);
+      const result: { data: Page; headers: Headers } = await request<Page>(url);
+      if (backwards) batches.splice(1, 0, extract(result.data));
+      else batches.push(extract(result.data));
+      const last: URL | undefined = newest && page === 0 ? paginationLink(result.headers, url, "last") : undefined;
+      if (last) backwards = true;
+      url = last ?? paginationLink(result.headers, url, backwards ? "prev" : "next");
     }
-    return all;
+    return batches.flat();
   }
 
   async function viewer(): Promise<string> {
@@ -242,21 +252,24 @@ export function createGithubClient({
     const since = new URLSearchParams({ since: new Date(sinceMs).toISOString() });
     const snapshot = item ?? await pull(ref.repo, ref.number);
     const [comments, issueEvents, reviewComments, reviews, checkEvents] = await Promise.all([
-      pages(`${issue}/comments?${since}`, (page: Comment[]) => page),
-      pages(`${issue}/events`, (page: IssueEvent[]) => page),
-      snapshot.kind === "pull" ? pages(`${pr}/comments?${since}`, (page: Comment[]) => page) : [],
-      snapshot.kind === "pull" ? pages(`${pr}/reviews`, (page: Review[]) => page) : [],
-      snapshot.headSha ? checks(path, snapshot.headSha) : [],
+      pages(`${issue}/comments?${since}`, (page: Comment[]) => page, true),
+      pages(`${issue}/events`, (page: IssueEvent[]) => page, true),
+      snapshot.kind === "pull" ? pages(`${pr}/comments?${since}`, (page: Comment[]) => page, true) : [],
+      snapshot.kind === "pull" ? pages(`${pr}/reviews`, (page: Review[]) => page, true) : [],
+      snapshot.headSha ? pullChecks(path, pr, snapshot.headSha, sinceMs === 0) : [],
     ]);
     const activity: GithubEvent[] = [];
-    for (const comment of [...comments, ...reviewComments]) {
-      const at = Date.parse(comment.created_at);
-      if (!Number.isFinite(at) || at < sinceMs) continue;
-      const body = comment.body ?? "";
-      activity.push({
-        type: "comment", key: `comment:${comment.id}`, at, login: comment.user?.login ?? "github",
-        ownMarker: body.includes(MARKER_PREFIX), text: body.slice(0, BOT_TASK_LIMITS.textMax), url: comment.html_url,
-      });
+    for (const [prefix, group] of [["comment", comments], ["review-comment", reviewComments]] as const) {
+      for (const comment of group) {
+        const at = Date.parse(comment.created_at);
+        if (!Number.isFinite(at) || at < sinceMs) continue;
+        const body = comment.body ?? "";
+        activity.push({
+          type: "comment", key: `${prefix}:${comment.id}`, at, login: comment.user?.login ?? "github",
+          ...(prefix === "review-comment" ? { legacyKey: `comment:${comment.id}` } : {}),
+          ownMarker: body.includes(MARKER_PREFIX), text: body.slice(0, BOT_TASK_LIMITS.textMax), url: comment.html_url,
+        });
+      }
     }
     for (const review of reviews) {
       const at = Date.parse(review.submitted_at ?? "");
@@ -267,32 +280,49 @@ export function createGithubClient({
       });
     }
     activity.push(...stateEvents(snapshot, issueEvents), ...checkEvents);
-    return activity.sort((a, b) => a.at - b.at);
+    return activity.filter((event) => event.at >= sinceMs).sort((a, b) => a.at - b.at);
+  }
+
+  async function pullChecks(path: string, pr: string, head: string, backfill: boolean): Promise<GithubEvent[]> {
+    if (!backfill) return checks(path, head);
+    const commits = await pages(`${pr}/commits`, (page: Array<{ sha: string }>) => page, true);
+    const earlier = [...new Set(commits.map(({ sha }) => sha))].filter((sha) => sha !== head).slice(-3);
+    const history = await Promise.all([
+      checks(path, head),
+      ...earlier.map(async (sha) => {
+        try { return await checks(path, sha); }
+        catch (error) {
+          if (error instanceof GithubError && error.status === 404) return [];
+          throw error;
+        }
+      }),
+    ]);
+    return history.flat();
   }
 
   async function checks(path: string, sha: string): Promise<GithubEvent[]> {
     const commit = `${path}/commits/${encodeURIComponent(sha)}`;
     const [runs, statuses] = await Promise.all([
-      pages(`${commit}/check-runs?filter=latest`, (page: { check_runs: Check[] }) => page.check_runs),
+      pages(`${commit}/check-runs?filter=all`, (page: { check_runs: Check[] }) => page.check_runs),
       pages(`${commit}/statuses`, (page: Status[]) => page),
     ]);
-    const latest = new Map<string, GithubEvent>();
-    function record(name: string, conclusion: string, at: number, login: string, url: string) {
-      if (!Number.isFinite(at) || (latest.get(name)?.at ?? -Infinity) >= at) return;
-      latest.set(name, { type: "check", key: `check:${name}:${sha}:${conclusion}`, at, login, name, conclusion, url });
+    const activity: GithubEvent[] = [];
+    function record(key: string, name: string, conclusion: string, at: number, login: string, url: string) {
+      if (!Number.isFinite(at)) return;
+      activity.push({ type: "check", key, legacyKey: `check:${name}:${sha}:${conclusion}`, at, login, name, conclusion, url });
     }
     for (const run of runs) {
       if (run.status === "completed" && run.conclusion) {
-        record(run.name, run.conclusion, Date.parse(run.completed_at ?? ""), run.app?.slug ?? "github", run.html_url);
+        record(run.id === undefined ? `check:${run.name}:${sha}:${run.conclusion}` : `check-run:${run.id}`, run.name, run.conclusion, Date.parse(run.completed_at ?? ""), run.app?.slug ?? "github", run.html_url);
       }
     }
     for (const status of statuses) {
       if (status.state !== "pending") {
-        record(status.context, status.state, Date.parse(status.updated_at ?? status.created_at),
+        record(status.id === undefined ? `check:${status.context}:${sha}:${status.state}` : `commit-status:${status.id}`, status.context, status.state, Date.parse(status.created_at),
           status.creator?.login ?? "github", status.target_url ?? "");
       }
     }
-    return [...latest.values()];
+    return activity;
   }
 
   async function postComment(ref: BotTaskGithubRef & { taskId: string }, text: string): Promise<{ id: number; url: string }> {
@@ -314,7 +344,14 @@ export function createGithubClient({
     return data;
   }
 
-  return { viewer, pull, events, postComment, merge };
+  async function lookupEvidence(path: string): Promise<EvidenceResponse> {
+    if (!path.startsWith("/repos/")) throw new GithubError("Invalid GitHub evidence endpoint");
+    return (await request<EvidenceResponse>(
+      path, "GET", undefined, undefined, EVIDENCE_TIMEOUT_MS,
+    )).data;
+  }
+
+  return { viewer, pull, events, postComment, merge, lookupEvidence };
 }
 
 export type GithubClient = ReturnType<typeof createGithubClient>;

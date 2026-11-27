@@ -365,6 +365,17 @@ describe("secret tier", () => {
 });
 
 describe("owner-only tier", () => {
+  it("keeps the bot task vault and outbound settings owner-only", async () => {
+    const { host, turn, set, saved } = fixture({ owner: true });
+    const access = await host.handle({ action: "get", id: "botTasks.githubAccess" }, turn);
+    expect(JSON.parse(String(access.body.text))).toMatchObject({ tier: "owner-only" });
+    const refused = await set("botTasks.githubAccess", { credential: "vault", githubToken: "fixture-token" });
+    expect(refused.status).toBeGreaterThanOrEqual(400);
+    expect(saved).toEqual([]);
+    const tasks = await host.handle({ action: "get", id: "botTasks.tasks" }, turn);
+    expect(String(tasks.body.text)).toContain("requireEvidenceForDone");
+    expect(String(tasks.body.text)).not.toMatch(/credential|githubToken|allowMerge/);
+  });
   it("explains and refuses with where to change it: sign-in, logins, pairing, backups, the domain", async () => {
     const { host, set, turn, cards, saved, routeCalls } = fixture();
     const got = await host.handle({ action: "get", id: "vault.logins" }, turn);

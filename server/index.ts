@@ -409,7 +409,7 @@ import {
   longCommandsPrompt,
   THREADS_PROMPT, WIDGET_PROMPT, JUST_DO_IT_PROMPT,
   LEARN_PROMPT, LEARN_RULES_PROMPT,
-  PROFILE_PROMPT, BOT_TASKS_PROMPT,
+  PROFILE_PROMPT, botTasksSystemPrompt,
   TEAM_MEMORY_PROMPT,
   TRIGGER_PROMPT, ROOM_CLOSE_PROMPT,
   ROUTINE_EXECUTION_PROMPT, READ_ONLY_ROUTINE_EXECUTION_PROMPT,
@@ -599,7 +599,7 @@ import { createTrustAnswers } from "./host/trust-answers.ts";
 import { createInternalThreadRoutes } from "./routes/internal-threads.ts";
 import { createBrowserEvidenceRoutes } from "./routes/browser-evidence.ts";
 import { createSignInCardRoutes } from "./routes/sign-in-cards.ts";
-import { createBotTasksHost } from "./bot-tasks/wiring.ts"; import { botTasksSettings, botTasksStatus } from "./bot-tasks/settings.ts"; import { createInternalChiefTeamRoutes } from "./routes/internal-chief-team.ts"; import { createInternalModelRoutes } from "./routes/internal-models.ts"; import { createOwnThreads } from "./host/own-threads.ts"; import { createEngineHints } from "./host/engine-hints.ts"; import { burstDefaultModel, burstProposalRefusal, createBurstHost } from "./host/burst-host.ts"; import { expandBurstTurnText } from "./burst/command.ts"; import { createBurstProposalRoutes, createBurstRoutes } from "./routes/burst.ts"; import { createCheckBacks } from "./host/check-backs.ts"; import { createTeamBoard } from "./board/wiring.ts"; import { writeCheckBackLine } from "./host/check-back-host.ts"; import { checkBackRefusal, createCheckBackRoutes, createCheckBackToolRoutes } from "./routes/check-backs.ts"; import { createHandoffStatus } from "./host/handoff-status.ts";
+import { createBotTasksHost } from "./bot-tasks/wiring.ts"; import { botTasksSettings, botTasksStatus, migrateBotTasksGithubToken } from "./bot-tasks/settings.ts"; import { createInternalChiefTeamRoutes } from "./routes/internal-chief-team.ts"; import { createInternalModelRoutes } from "./routes/internal-models.ts"; import { createOwnThreads } from "./host/own-threads.ts"; import { createEngineHints } from "./host/engine-hints.ts"; import { burstDefaultModel, burstProposalRefusal, createBurstHost } from "./host/burst-host.ts"; import { expandBurstTurnText } from "./burst/command.ts"; import { createBurstProposalRoutes, createBurstRoutes } from "./routes/burst.ts"; import { createCheckBacks } from "./host/check-backs.ts"; import { createTeamBoard } from "./board/wiring.ts"; import { writeCheckBackLine } from "./host/check-back-host.ts"; import { checkBackRefusal, createCheckBackRoutes, createCheckBackToolRoutes } from "./routes/check-backs.ts"; import { createHandoffStatus } from "./host/handoff-status.ts";
 import { createRoomHoldRoutes } from "./routes/room-holds.ts";
 import { checkedGroupResponder, createGroupRoutes } from "./routes/groups.ts";
 import { createChannelRoutes } from "./routes/channels.ts";
@@ -726,6 +726,11 @@ const threadStarters = new ThreadStarters(join(DATA_DIR, "thread-starters.json")
 const commandAllowlist = new CommandAllowlistStore(join(DATA_DIR, "command-allowlist.json"));
 // Every value saved in the Vault is scrubbed from whatever a bot or a transcript can read.
 const logins = new VaultStore({ dataDir: DATA_DIR, secretChanged: (item) => mcpServersHost.keyChanged(item) });
+try {
+  migrateBotTasksGithubToken(DATA_DIR, logins);
+} catch {
+  console.warn("bot-tasks: GitHub token migration did not finish; the legacy settings file was left in place.");
+}
 removeRetiredAppFiles(DATA_DIR); const emailService = createEmailService({ dataDir: DATA_DIR, publicOnly: Boolean(CLOUD_HOME), refusal: CLOUD_TEAM ? "Email isn't on a Team Cloud yet: every bot there would read the same mailbox." : null }); addHeldSecretScrubber((text) => emailService.scrub(text));
 const heldSecrets = new HeldSecrets(logins);
 addHeldSecretScrubber((text) => heldSecrets.scrub(text));
@@ -2931,7 +2936,7 @@ function previewSystemPrompt(bot: BotRecord) {
     { id: "credential", label: "Credentials", text: agentsMounted ? CREDENTIAL_PROMPT + botLogins.secretsPrompt(bot.id, TEAM_READER) : "" },
     { id: "routine", label: "Triggers", text: agentsMounted ? TRIGGER_PROMPT : "" },
     { id: "profile", label: "Profile changes", text: agentsMounted ? PROFILE_PROMPT : "" },
-    { id: "bot-tasks", label: "Task list", text: agentsMounted && botTasksSettings(cfg).enabled ? BOT_TASKS_PROMPT : "" },
+    { id: "bot-tasks", label: "Task list", text: botTasksSystemPrompt(botTasksSettings(cfg).enabled, agentsMounted) },
     { id: "section-context", label: "Section context", text: sectionContextSystemPrompt(bot.section) },
     { id: "team-memory", label: "Team memory", text: teamMemory.systemPrompt(bot.section) + (agentsMounted ? TEAM_MEMORY_PROMPT : "") },
     teamAvailabilityPart(agentsMounted && coordination ? peers : []),
@@ -8147,7 +8152,7 @@ async function beginTurn(
       const credentialPrompt = integrations.agents ? CREDENTIAL_PROMPT + botLogins.secretsPrompt(bot.id, vaultReaders.turn(threadId)) + THREADS_PROMPT + WIDGET_PROMPT : "";
       const routinePrompt = integrations.agents ? TRIGGER_PROMPT : "";
       const profilePrompt = integrations.agents ? PROFILE_PROMPT : "";
-      const botTasksPrompt = integrations.agents && botTasksSettings(cfg).enabled ? BOT_TASKS_PROMPT : "";
+      const botTasksPrompt = botTasksSystemPrompt(botTasksSettings(cfg).enabled, Boolean(integrations.agents));
       const recallPrompt = integrations.agents && bot.memoryEnabled !== false ? SESSION_SEARCH_SYSTEM_PROMPT : "";
       const learnPrompt = skillAuthoring ? profilePrompt ? LEARN_RULES_PROMPT : LEARN_PROMPT : "";
 
@@ -9954,7 +9959,7 @@ async function runClaimedGroupMemberTurn(
     integrations.agents && (!orchestration || orchestration.roomHandoffId) && "For actual OpenMausBot teamwork, discover IDs with list_room_targets and use coordinate_bots for advice or work in this or another room. Do not substitute native coding helpers for these named bots. Consult only when needed to make a decision; no discussion step is mandatory. Give concrete responsibilities, exact accessible paths and acceptance checks. End your turn after assigning; busy teammates queue and results automatically resume you. When they return, finish the requested verification and give the user one final answer. Native helper names are not evidence that an OpenMausBot teammate participated. Plain @mentions are only for conversational replies in this room." + requesterRule,
     integrations.agents && TRIGGER_PROMPT.trim(), integrations.agents && !readyGroup.dm && ROOM_CLOSE_PROMPT,
     integrations.agents && PROFILE_PROMPT.trim(),
-    integrations.agents && botTasksSettings(cfg).enabled && BOT_TASKS_PROMPT.trim(),
+    botTasksSystemPrompt(botTasksSettings(cfg).enabled, Boolean(integrations.agents)).trim(),
     integrations.agents && skillAuthoringEnabled(cfg) && LEARN_RULES_PROMPT.trim(),
     orchestration?.systemInstructions,
   ]
@@ -11373,7 +11378,7 @@ function claimPhoneSecretBotDeletion(botId: string): (() => void) | null {
 
 const secretCards = createSecretCards({ store, cfg, botLogins, vaultStore: logins, vaultReader: vaultReaders.turn, phoneSecrets, phoneSecretSubmissions, connectorThread, answerCardNode, followCard: (threadId, from, to) => coordinator.followCard(threadId, from, to), threadLanguage, email: { connect: (request, reading) => emailService.connect(request, reading), refusal: () => emailService.status().reason, connected: (address) => { const one = emailService.store.get(address); return Boolean(one && !one.problem); }, sendingProblem: (address) => emailService.sendingProblem(address), account: (address) => emailService.status().accounts.find((one) => one.address.toLowerCase() === address.toLowerCase()), checkOutgoing: (address, fields) => emailService.checkOutgoing(address, fields), profileAddress: () => cfg.profile?.email?.trim() || undefined }, dataDir: DATA_DIR, providerKeysRefused: Boolean(hostedModels), layerFolder: (botId, threadId) => workspaceDir(teamHost.layer(botId, threadId)), turnVm: (threadId) => localVmThreadTargets.get(threadId)?.key });
 const teamBoard = createTeamBoard({ dataDir: DATA_DIR, team: Boolean(CLOUD_TEAM), enabled: () => cfg.features?.teamBoard === true, store, visible: (auth) => visibleTo(viewerFor(auth)), person: (auth) => auth.kind === "session" && auth.session.email ? { person: personKey(auth.session), name: messageSender(auth)?.name ?? "" } : null, sender: messageSender, opened: (auth, threadId) => { if (auth.kind === "session") threadStarters.set(threadId, actorKey(auth)); }, roomRefusal: (groupId) => phoneSecretSubmissions.hasGroup(groupId) ? "This room is securely saving a credential. Try again when it finishes." : null, broadcast, botFree: (botId, groupId, threadId) => { const bot = store.bot(botId), group = store.group(groupId); return Boolean(bot && group && !bot.hidden && !bot.busy && !bot.approvalGrant && !botHolds.held(botId) && !starterCaps.pausedText(botId, undefined, threadId) && !roomHeld(group, botId) && !providerInstancesChanging.has(bot.modelSelection.instanceId) && !roomMemberLock.heldElsewhere(botId, threadId) && !activeGroupTurnForBot(botId)); }, threadWorking: groupThreadIsWorking, capped: (botId) => { try { assertWithinBudget(cfg, DATA_DIR); usageCapGate.assertTurn(botId, false); return null; } catch (error) { const refused = error as { code?: unknown; resetsAt?: unknown }; return refused?.code === USAGE_CAP_CODE ? { resetsAt: typeof refused.resetsAt === "number" ? refused.resetsAt : Date.now() + 3_600_000 } : null; } }, modelReady: (botId) => { const instance = registry.get(store.bot(botId)?.modelSelection.instanceId ?? ""); return Boolean(instance && !policyModelRefusal(instance) && registry.lastSnapshot(instance.instanceId)?.authenticated !== false); }, startTurn: (groupId, threadId, botId, text, sender) => { startGroupTurn(groupId, text, undefined, undefined, "chat", undefined, { threadId, mentions: [botId], trigger: { kind: "bot", botId }, sender }); }, askPerson: teamMessages.ask, cardWaiting: (threadId) => Boolean(personWaits.open(threadId)), timeScale: Number(process.env.OMB_BOARD_TIME_SCALE) || undefined }); ROUTES.push(teamBoard.routes); pokeBoard = teamBoard.poke; ROUTES.push(createCheckBackRoutes({ checkBacks, sees: (auth, threadId) => visibleTo(viewerFor(auth)).thread(threadId), refusal: (auth, threadId, messageId) => cardAnswerRefusal(auth, threadId, messageId, "deny") })); ROUTES.push(createBurstRoutes({ owner: (id) => burst.owner(id), sees: (auth, threadId) => visibleTo(viewerFor(auth)).thread(threadId), refusal: (auth, threadId, id) => cardAnswerRefusal(auth, threadId, id, "allow"), view: (id) => burst.view(id), run: (id) => burst.run(id), cancel: (id) => burst.cancel(id), retry: (id) => burst.retryFailed(id), edit: (id, plan) => burst.edit(id, plan) })); ROUTES.push(createSecretCardRoutes({ cards: secretCards, phoneSecretSubmissions, threadVisible: (auth, threadId) => visibleTo(viewerFor(auth)).thread(threadId), answerContext: (auth, botId, threadId) => ({ personalCloud: Boolean(CLOUD_PERSONAL), shared: sharedMembership(), owner: (CLOUD_TEAM ? teamOwners.routing.askedPerson(botId, threadId) : null) ?? threadStarters.get(threadId) ?? null, person: auth.kind === "session" ? personKey(auth.session) : null }) }));
-const botTasksHost = createBotTasksHost({ dataDir: DATA_DIR, config: () => cfg, botName: (botId) => store.bot(botId)?.name, bots: () => store.bots.map((bot) => ({ id: bot.id, name: bot.name })), person: (auth) => messageSender(auth)?.name ?? "Person", broadcast: (payload) => broadcast(payload, { adminOnly: true }) }); ROUTES.push(botTasksHost.routes);
+const botTasksHost = createBotTasksHost({ dataDir: DATA_DIR, config: () => cfg, vaultToken: () => logins.botTasksGithubToken(), botName: (botId) => store.bot(botId)?.name, bots: () => store.bots.map((bot) => ({ id: bot.id, name: bot.name })), person: (auth) => messageSender(auth)?.name ?? "Person", broadcast: (payload) => broadcast(payload, { adminOnly: true }) }); ROUTES.push(botTasksHost.routes);
 
 // By design OpenMausBot never receives a website password: the person signs in where the bot works, and the bot uses that session.
 
@@ -11557,7 +11562,7 @@ function configStatus() {
   const eventLogMaxBytes = threadEventLogMaxBytes(cfg);
   const eventLogRetentionDays = threadEventLogRetentionDays(cfg);
   return {
-    botTasks: botTasksStatus(cfg), cloudStarter: cloudPlanTier.starter(), waitingForRoom: engineMemory.waiting(), planTurns: starterCaps.status(), awakeLimit: starterAwake.limit(), pausedBots: starterAwake.paused(), pausedByPerson: botHolds.state(), heldBots: botHolds.heldBots(), ...(routines?.schedulerState().unreadable ? { routinesUnreadable: true } : {}), xai: keyStatus(cfg.xai?.key),
+    botTasks: botTasksStatus(cfg, logins.botTasksGithubToken()), cloudStarter: cloudPlanTier.starter(), waitingForRoom: engineMemory.waiting(), planTurns: starterCaps.status(), awakeLimit: starterAwake.limit(), pausedBots: starterAwake.paused(), pausedByPerson: botHolds.state(), heldBots: botHolds.heldBots(), ...(routines?.schedulerState().unreadable ? { routinesUnreadable: true } : {}), xai: keyStatus(cfg.xai?.key),
     mistral: keyStatus(cfg.mistral?.key),
     cerebras: keyStatus(cfg.cerebras?.key),
     groq: keyStatus(cfg.groq?.key), greenference: keyStatus(cfg.greenference?.key), modelgo: keyStatus(cfg.modelgo?.key),
@@ -12215,7 +12220,7 @@ const postiz = createPostiz({ cfg: () => cfg, mcpOAuth, persistMcpServers: persi
   checkedModelSelection, policyModelRefusal, browserSessionSpec, configStatus,
   configForAccess: (status, auth) => configForAccess(status as ReturnType<typeof configStatus>, auth.scopes.includes("admin"), auth.kind === "session" ? auth.session : null),
   ...(CLOUD_TEAM ? { ownProfile: (auth: RequestAuth, profile: { name?: string; avatarUrl?: string; aboutMe?: string }) => auth.kind === "session" ? (teamHost.saveMemberProfile(auth.session, profile), true) : false, ownHints: (auth: RequestAuth, hints: string[]) => auth.kind === "session" ? (teamWelcome.save(personKey(auth.session), { hints }), true) : false } : {}),
-  resyncOpenCodeProviderKeys, revokeEngineCapabilities, reloadProviders, broadcast, drainQueuedSends, postiz,
+  resyncOpenCodeProviderKeys, revokeEngineCapabilities, reloadProviders, broadcast, drainQueuedSends, postiz, botTasksVault: logins,
 }); ROUTES.push(createPostizRoutes({ postiz }), configRoutes);
 const instanceRoutes = createInstanceRoutes({
   store, cfg, registry, sessions, providerAuthSessions,

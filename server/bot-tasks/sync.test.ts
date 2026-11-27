@@ -22,7 +22,7 @@ function fixture(item: GithubItem, events: GithubEvent[] = []) {
 }
 
 describe("syncGithubTask", () => {
-  it("imports first-sync activity in chronological order and skips historical state and own comments", async () => {
+  it("imports first-sync activity and historical states in chronological order, without own comments", async () => {
     const closed = { ...open, state: "closed" as const };
     const client = fixture(closed, [
       comment,
@@ -31,15 +31,16 @@ describe("syncGithubTask", () => {
       { type: "review", state: "APPROVED", key: "review:1", text: "Approved", at: changeAt, login: "dev", url },
       check,
     ]);
-    const result = await syncGithubTask({ task: baseTask, client, now, since });
+    const result = await syncGithubTask({ task: baseTask, client, now, since: 0 });
     expect(result.githubState).toEqual({ state: "closed", syncedAt: now });
     expect(result.ref).toEqual({ ...baseTask.github, kind: "pull" });
-    expect(client.events).toHaveBeenCalledWith(result.ref, since, closed);
+    expect(client.events).toHaveBeenCalledWith(result.ref, 0, closed);
     expect(result.activity).toEqual([
       { type: "github_check", key: check.key, at: check.at, by: { kind: "github", login: "ci" },
         name: "build", conclusion: "success", url },
       { type: "github_comment", key: comment.key, at: comment.at, by: { kind: "github", login: "dev" },
         text: "Review ready", url },
+      { type: "github_state", key: "octo/example#42:state:closed:old", at: changeAt, by: { kind: "github", login: "dev" }, state: "closed", url },
       { type: "github_review", key: "review:1", at: changeAt, by: { kind: "github", login: "dev" },
         state: "APPROVED", text: "Approved", url },
     ]);
@@ -52,7 +53,7 @@ describe("syncGithubTask", () => {
       ...baseTask, github: first.ref, githubState: first.githubState,
       activity: first.activity.map((entry) => ({ ...entry, id: entry.key })),
     };
-    const second = await syncGithubTask({ task, client: fixture(open, [comment, check, check]), now: now + 1, since });
+    const second = await syncGithubTask({ task, client: fixture(open, [comment, check, check]), now: now + 1, since: 0 });
     expect(second.activity.map(({ key }) => key)).toEqual([check.key]);
   });
 
@@ -70,18 +71,31 @@ describe("syncGithubTask", () => {
     const result = await syncGithubTask({ task, client, now, since });
     expect(result.githubState).toEqual({ state: current, syncedAt: now });
     expect(result.activity).toEqual([
-      { type: "github_state", state, key, at: changeAt, by: { kind: "github", login: "maintainer" }, url },
+      { type: "github_state", state, key: `octo/example#42:${key}`, at: changeAt, by: { kind: "github", login: "maintainer" }, url },
     ]);
     await expect(syncGithubTask({
-      task: { ...task, githubState: result.githubState }, client, now: now + 1, since,
+      task: { ...task, githubState: result.githubState }, client, now: now + 1, since: now,
     })).resolves.toMatchObject({ activity: [] });
+  });
+
+  it("does not confuse state events from a former link with the current item", async () => {
+    const task: BotTask = {
+      ...baseTask,
+      activity: [{
+        id: "old", type: "github_state", state: "merged", key: "state:merged", at: since - 2,
+        url: "https://github.com/octo/example/pull/41", by: { kind: "github", login: "dev" },
+      }],
+    };
+    const state: GithubEvent = { type: "state", state: "merged", key: "state:merged", at: since - 1, login: "dev", url };
+    const result = await syncGithubTask({ task, client: fixture({ ...open, state: "merged" }, [state]), now, since: 0 });
+    expect(result.activity).toMatchObject([{ key: "octo/example#42:state:merged" }]);
   });
 
   it("records a changed snapshot even when the matching GitHub event is unavailable", async () => {
     const task: BotTask = { ...baseTask, githubState: { state: "closed", syncedAt: since } };
     const result = await syncGithubTask({ task, client: fixture(open), now, since });
     expect(result.activity).toEqual([
-      { type: "github_state", state: "reopened", key: `state:reopened:${now}`, at: now, by: { kind: "github", login: "github" }, url },
+      { type: "github_state", state: "reopened", key: `octo/example#42:state:reopened:${now}`, at: now, by: { kind: "github", login: "github" }, url },
     ]);
   });
 

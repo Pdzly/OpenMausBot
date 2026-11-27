@@ -12,7 +12,7 @@ let botTasks: Record<string, unknown>;
 const frames: Array<Record<string, unknown>> = [];
 
 const host = () => createBotTasksHost({
-  dataDir: dir, config: () => ({ botTasks }) as unknown as AppConfig, botName: () => "Lin", bots: () => [{ id: "lin", name: "Lin" }],
+  dataDir: dir, vaultToken: () => null, config: () => ({ botTasks }) as unknown as AppConfig, botName: () => "Lin", bots: () => [{ id: "lin", name: "Lin" }],
   person: () => "Philipp", broadcast: (payload) => frames.push(payload), now: () => clock, tickMs: 1_000_000,
 });
 

@@ -8,7 +8,8 @@ import {
   type BotTasksSettings, type BotTaskSummary,
 } from "../../shared/bot-tasks.ts";
 import { redactSecretsInText } from "../../shared/redact.ts";
-import { BotTaskError, githubRefsIn, parseEvidence, parseRef, refLabel, supportsDone } from "./evidence.ts";
+import { BotTaskError, githubRefsIn, parseEvidence, parseRef, refLabel, supportsDone, verifyEvidence } from "./evidence.ts";
+import type { GithubClient } from "./github.ts";
 import { repoAllowed } from "./settings.ts";
 import { BOT_TASKS_FILE, readBotTasksFile, writeBotTasksFile } from "./store.ts";
 
@@ -30,6 +31,7 @@ export interface GithubSyncResult {
  * comment as a hidden marker, so a later sync knows the comment is this app's own. */
 export interface GithubPort {
   sync(task: BotTask, since: number): Promise<GithubSyncResult>;
+  lookupEvidence: GithubClient["lookupEvidence"];
   pull(ref: BotTaskGithubRef): Promise<{ kind: "pull" | "issue"; state: "open" | "closed" | "merged"; mergeable: boolean | null }>;
   postComment(ref: BotTaskGithubRef, text: string, taskId: string): Promise<{ id: string | number; url: string }>;
   merge(ref: BotTaskGithubRef): Promise<{ merged: boolean; sha?: string; message?: string }>;
@@ -56,6 +58,7 @@ export interface TaskFilter {
 
 const OPEN_STATUSES: readonly BotTaskStatus[] = ["open", "in_progress", "blocked", "review"];
 const RECENT_DONE_MS = 7 * 24 * 3_600_000;
+const SYNC_OVERLAP_MS = 60_000;
 const clean = (text: string, max: number) => redactSecretsInText(text).trim().slice(0, max);
 
 export function createBotTasks(deps: BotTasksDeps) {
@@ -65,7 +68,7 @@ export function createBotTasks(deps: BotTasksDeps) {
   let tasks: BotTask[] | null = null;
   const listeners = new Set<(taskId: string) => void>();
   const posting = new Set<string>();
-  const syncing = new Set<string>();
+  const syncing = new Map<string, { linkId: string | undefined; pending: Promise<{ added: number; task: BotTask }> }>();
 
   const loaded = (): BotTask[] => (tasks ??= readBotTasksFile(file));
   const save = (next: BotTask[], changed: readonly string[]) => {
@@ -85,20 +88,25 @@ export function createBotTasks(deps: BotTasksDeps) {
   const capLog = (entries: BotTaskActivity[]): BotTaskActivity[] => {
     const over = entries.length - BOT_TASK_LIMITS.activityMax;
     if (over <= 0) return entries;
-    const imported = entries.filter((entry) => entry.type === "github_comment" || entry.type === "github_check" || entry.type === "github_review" || entry.type === "sync_error");
-    const droppable = new Set<BotTaskActivity>([...imported, ...entries.filter((entry) => entry.type === "comment")].slice(0, over));
+    const fromGithub = (entry: BotTaskActivity) => entry.by.kind === "github" || entry.type === "sync_error";
+    const link = entries.findLast((entry) => entry.type === "github_ref");
+    const droppable = new Set([
+      ...entries.filter(fromGithub),
+      ...entries.filter((entry) => entry.type === "comment"),
+      ...entries.filter((entry) => !fromGithub(entry) && entry.type !== "created" && entry.type !== "comment" && entry !== link),
+    ].slice(0, over));
     return entries.filter((entry) => !droppable.has(entry));
   };
   /** Replaces one task with the result of `change`; the log gets `added`. */
   const commit = (id: string, change: (task: BotTask) => BotTask, added: BotTaskActivity[], at = now()): BotTask => {
     const current = found(id);
     const next = change({ ...current, activity: current.activity });
-    const updated: BotTask = { ...next, updatedAt: at, activity: capLog([...next.activity, ...added]) };
+    const updated: BotTask = { ...next, updatedAt: at, activity: capLog([...next.activity, ...added].sort((a, b) => a.at - b.at)) };
     save(loaded().map((task) => (task.id === id ? updated : task)), [id]);
     return updated;
   };
   const summary = (task: BotTask): BotTaskSummary => {
-    const { activity: entries, ...rest } = task;
+    const { activity: entries, evidence: _evidence, ...rest } = task;
     return { ...rest, ownerName: deps.botName(task.ownerBotId) ?? task.ownerBotId, activityCount: entries.length };
   };
   const mayChange = (task: BotTask, by: BotTaskActor) => by.kind !== "bot" || by.id === task.ownerBotId || (task.createdBy.kind === "bot" && task.createdBy.id === by.id);
@@ -114,7 +122,14 @@ export function createBotTasks(deps: BotTasksDeps) {
   const withRef = (task: BotTask, ref: BotTaskGithubRef, by: BotTaskActor, at: number): { task: BotTask; entry: BotTaskActivity } =>
     ({ task: { ...task, github: ref }, entry: activity(by, { type: "github_ref", ref }, at) });
 
-  return {
+  const latestLink = (task: BotTask) => task.activity.findLast((entry) => entry.type === "github_ref");
+  const startBackfill = (task: BotTask) => {
+    const settings = deps.settings();
+    if (!task.github || !settings.enabled || !settings.githubSync || !repoAllowed(settings, task.github.repo) || !deps.github()) return;
+    void api.sync(task.id).catch(() => {});
+  };
+
+  const api = {
     onChange(listener: (taskId: string) => void): () => void {
       listeners.add(listener);
       return () => { listeners.delete(listener); };
@@ -139,6 +154,7 @@ export function createBotTasks(deps: BotTasksDeps) {
       }
       task = { ...task, activity: added };
       save([...loaded(), task], [task.id]);
+      if (ref) startBackfill(task);
       return { task, suggested: ref ? [] : candidates };
     },
 
@@ -155,35 +171,59 @@ export function createBotTasks(deps: BotTasksDeps) {
         entries.push(linked.entry);
         return linked.task;
       }, entries, at);
+      if (ref) startBackfill(task);
       return { task, suggested: ref ? [] : candidates };
     },
 
-    setStatus(id: string, input: { status: BotTaskStatus; evidence?: unknown; comment?: string; by: BotTaskActor }): BotTask {
+    async setStatus(id: string, input: { status: BotTaskStatus; evidence?: unknown; comment?: string; ownerBotId?: string; by: BotTaskActor }): Promise<BotTask> {
       const before = found(id);
       needOwn(before, input.by, "change its status");
+      if (input.ownerBotId && !deps.botName(input.ownerBotId)) throw new BotTaskError(400, `No bot has the id ${input.ownerBotId}. Use list_bots for the ids.`);
       const settings = deps.settings();
       const rawEvidence = input.evidence === undefined ? [] : input.evidence;
       if (!Array.isArray(rawEvidence)) throw new BotTaskError(400, "evidence is a list of items.");
       if (rawEvidence.length > BOT_TASK_LIMITS.evidencePerMove) throw new BotTaskError(400, `At most ${BOT_TASK_LIMITS.evidencePerMove} evidence items per move.`);
-      const evidence: BotTaskEvidence[] = rawEvidence.map(parseEvidence);
-      const required = (input.status === "done" && settings.requireEvidenceForDone) || (input.status === "review" && settings.requireEvidenceForReview);
-      if (required && !supportsDone(evidence)) {
-        throw new BotTaskError(422, `Moving a task to ${input.status} needs evidence: a commit sha, a CI run URL, a review or comment URL, or a command with the exit code 0. ${evidence.length ? "Only failed commands were given." : "None was given."} Nothing was changed.`);
-      }
-      if (before.status === input.status && !input.comment) throw new BotTaskError(409, `The task is already ${input.status}.`);
-      const at = now();
+      const claims = rawEvidence.map(parseEvidence);
+      const moved = before.status !== input.status;
+      const ownerChanged = input.ownerBotId !== undefined && input.ownerBotId !== before.ownerBotId;
+      if (!moved && !input.comment && !ownerChanged) throw new BotTaskError(409, `The task is already ${input.status}.`);
       const comment = input.comment ? clean(input.comment, BOT_TASK_LIMITS.textMax) : "";
+      const link = autoRef(before, [comment, ...claims.flatMap((item) => (item.kind === "review_url" || item.kind === "ci_run" ? [item.url] : []))]);
+      const required = (input.status === "done" && settings.requireEvidenceForDone) || (input.status === "review" && settings.requireEvidenceForReview);
+      const verify = moved && (input.status === "done" || required);
+      let evidence: BotTaskEvidence[] = claims;
+      if (verify && claims.length) {
+        const lookup = deps.github()?.lookupEvidence;
+        const checkedAt = now();
+        evidence = await Promise.all(claims.map((claim) => verifyEvidence(claim, before.github ?? link.ref, settings, lookup, checkedAt)));
+        const failed = evidence.find((item) => item.verification?.status === "failed");
+        if (failed) throw new BotTaskError(422, `Blocked: ${failed.verification?.detail}`);
+      }
+      if (moved && required && !supportsDone(evidence)) {
+        const issue = evidence.find((item) => item.verification?.status === "unverifiable")?.verification?.detail;
+        throw new BotTaskError(422, `Moving a task to ${input.status} needs evidence: a verified commit, CI run or review link, or a recorded command with exit code 0.${issue ? ` ${issue}` : ""}`);
+      }
+      const current = found(id);
+      if (before.status !== current.status || before.ownerBotId !== current.ownerBotId || latestLink(before)?.id !== latestLink(current)?.id) {
+        throw new BotTaskError(409, "The task changed during verification. Read it again before retrying.");
+      }
+      const at = now();
       const entries: BotTaskActivity[] = [];
-      if (before.status !== input.status) entries.push(activity(input.by, { type: "status", from: before.status, to: input.status, ...(evidence.length ? { evidence } : {}) }, at));
+      if (moved) entries.push(activity(input.by, { type: "status", from: before.status, to: input.status, ...(evidence.length ? { evidence } : {}) }, at));
+      if (ownerChanged) entries.push(activity(input.by, { type: "owner", from: before.ownerBotId, to: input.ownerBotId! }, at));
       if (comment) entries.push(activity(input.by, { type: "comment", text: comment }, at));
-      const link = autoRef(before, [comment, ...evidence.flatMap((item) => (item.kind === "review_url" || item.kind === "ci_run" ? [item.url] : []))]);
-      return commit(id, (current) => {
-        const moved = { ...current, status: input.status };
-        if (!link.ref) return moved;
-        const linked = withRef(moved, link.ref, { kind: "system" }, at);
+      const task = commit(id, (currentTask) => {
+        const updated = {
+          ...currentTask, status: input.status, ownerBotId: input.ownerBotId ?? currentTask.ownerBotId,
+          ...(moved ? { evidence: evidence.length ? evidence : undefined } : {}),
+        };
+        if (!link.ref) return updated;
+        const linked = withRef(updated, link.ref, { kind: "system" }, at);
         entries.push(linked.entry);
         return linked.task;
       }, entries, at);
+      if (link.ref) startBackfill(task);
+      return task;
     },
 
     setOwner(id: string, ownerBotId: string, by: BotTaskActor): BotTask {
@@ -199,10 +239,12 @@ export function createBotTasks(deps: BotTasksDeps) {
       const before = found(id);
       if (before.github && refLabel(before.github).toLowerCase() === refLabel(ref).toLowerCase()) return before;
       const at = now();
-      return commit(id, (current) => {
+      const linked = commit(id, (current) => {
         const { githubState: _old, ...rest } = current;
         return { ...rest, github: ref };
       }, [activity(by, { type: "github_ref", ref }, at)], at);
+      startBackfill(linked);
+      return linked;
     },
 
     list(filter: TaskFilter = {}): BotTaskSummary[] {
@@ -229,27 +271,47 @@ export function createBotTasks(deps: BotTasksDeps) {
       if (!repoAllowed(settings, task.github.repo)) throw new BotTaskError(403, `${task.github.repo} is not on the allowed repositories of Settings → Bot tasks, so nothing is read from it.`);
       const github = deps.github();
       if (!github) throw new BotTaskError(503, "No GitHub credential is usable. Choose the gh CLI or save a token in Settings → Bot tasks.");
-      if (syncing.has(id)) return { added: 0, task };
-      syncing.add(id);
-      try {
-        const since = task.activity.findLast((entry) => entry.type === "github_ref")?.at ?? task.createdAt;
+      const link = latestLink(task);
+      const linkId = link?.id;
+      const running = syncing.get(id);
+      if (running && running.linkId === linkId) return running.pending;
+      const linkAt = link?.at ?? task.createdAt;
+      const syncStartedAt = now();
+      const since = task.githubState?.historyBackfilled ? Math.max(1, task.githubState.syncedAt - SYNC_OVERLAP_MS) : 0;
+      const currentLink = () => latestLink(found(id))?.id === linkId;
+      const pending = (async () => {
         let result: GithubSyncResult;
         try {
           result = await github.sync(task, since);
         } catch (error) {
+          if (!currentLink()) return { added: 0, task: found(id) };
           const text = redactSecretsInText(error instanceof Error ? error.message : String(error)).slice(0, 300);
           const last = found(id).activity.findLast((entry) => entry.type === "sync_error");
           if (!last || last.type !== "sync_error" || last.text !== text) commit(id, (current) => current, [activity({ kind: "system" }, { type: "sync_error", text })]);
           throw new BotTaskError(502, `GitHub sync failed: ${text}`);
         }
-        const at = now();
-        const have = new Set(found(id).activity.flatMap((entry) => (entry.key ? [entry.key] : [])));
-        const fresh = result.activity.filter((entry) => !have.has(entry.key));
-        const entries = fresh.map(({ key, at: when, by, ...body }) => activity(by, body as BotTaskActivityBody, when, key));
-        const updated = commit(id, (current) => ({ ...current, github: result.ref, githubState: { state: result.githubState.state, syncedAt: at } }), entries, entries.length ? at : found(id).updatedAt);
-        return { added: entries.length, task: updated };
+        const current = found(id);
+        if (!currentLink()) return { added: 0, task: current };
+        const have = new Set(current.activity.map((entry) => entry.key));
+        const entries: BotTaskActivity[] = [];
+        for (const { key, at, by, ...body } of result.activity) {
+          if (at < since || have.has(key)) continue;
+          have.add(key);
+          entries.push({ ...activity(by, body, at, key), ...(at < linkAt ? { imported: true } : {}) });
+        }
+        const retained = new Set(capLog([...current.activity, ...entries].sort((a, b) => a.at - b.at)));
+        const added = entries.filter((entry) => retained.has(entry)).length;
+        const updated = commit(id, (current) => ({
+          ...current, github: result.ref,
+          githubState: { state: result.githubState.state, syncedAt: syncStartedAt, historyBackfilled: true },
+        }), entries, added ? now() : current.updatedAt);
+        return { added, task: updated };
+      })();
+      syncing.set(id, { linkId, pending });
+      try {
+        return await pending;
       } finally {
-        syncing.delete(id);
+        if (syncing.get(id)?.pending === pending) syncing.delete(id);
       }
     },
 
@@ -307,6 +369,7 @@ export function createBotTasks(deps: BotTasksDeps) {
       }
     },
   };
+  return api;
 }
 
 export type BotTasks = ReturnType<typeof createBotTasks>;

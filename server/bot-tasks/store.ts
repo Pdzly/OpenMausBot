@@ -26,7 +26,7 @@ const taskSchema = z.looseObject({
   createdAt: z.number(),
   updatedAt: z.number(),
   github: ref.optional(),
-  githubState: z.object({ state: z.enum(["open", "closed", "merged"]), syncedAt: z.number() }).optional(),
+  githubState: z.object({ state: z.enum(["open", "closed", "merged"]), syncedAt: z.number(), historyBackfilled: z.literal(true).optional() }).optional(),
   activity: z.array(z.looseObject({ id: z.string(), at: z.number(), by: actor, type: z.string() })),
 });
 const fileSchema = z.object({ version: z.literal(1), tasks: z.array(z.unknown()) });
@@ -49,7 +49,9 @@ export function readBotTasksFile(file: string): BotTask[] {
     }
     const tasks = parsed.data.tasks.flatMap((candidate) => {
       const task = taskSchema.safeParse(candidate);
-      return task.success ? [task.data as unknown as BotTask] : [];
+      if (!task.success) return [];
+      task.data.activity.sort((a, b) => a.at - b.at);
+      return [task.data as unknown as BotTask];
     });
     if (tasks.length < parsed.data.tasks.length) keepCopy(file);
     return tasks;

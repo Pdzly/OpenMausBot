@@ -494,6 +494,7 @@ beforeAll(async () => {
     JSON.stringify({
       // this suite owns the one-shot's reply file (FAKE_CLAUDE_TEXT_FILE below); the setup card's tests turn its answers on
       features: { browser: false, smartSetupChoices: false },
+      botTasks: { credential: "token", githubToken: "fixture-legacy-bot-tasks-token" },
       instances: {
         ghost: { driver: "not-a-real-driver", displayName: "Ghost" },
         claude: { driver: "claudeAgent", displayName: "Fixture Claude", config: { cli: FAKE_CLAUDE_CLI } },
@@ -13215,6 +13216,25 @@ describe("harness HTTP API", () => {
     const after = await api("GET", "/api/config");
     expect(after.body.deepseek).toEqual({ configured: true });
     expect(JSON.stringify(after.body)).not.toContain("ds-secret");
+  });
+
+  it("migrates the bot tasks token on boot and uses the vault for PATCH, GET and clearing", async () => {
+    const path = join(home, ".openmausbot", "config.json");
+    const original = await api("GET", "/api/config");
+    expect(original.body.botTasks).toMatchObject({ enabled: false, credential: "vault", githubTokenSet: true });
+    expect(JSON.parse(readFileSync(path, "utf8")).botTasks).toEqual({ credential: "vault" });
+    const token = "fixture-replacement-bot-tasks-token";
+    try {
+      const patched = await api("PATCH", "/api/config", { botTasks: { githubToken: token, credential: "vault" } });
+      expect(patched.status, patched.body.error).toBe(200);
+      expect(patched.body.botTasks).toMatchObject({ credential: "vault", githubTokenSet: true });
+      expect(JSON.stringify(patched.body)).not.toContain(token);
+      expect(readFileSync(path, "utf8")).not.toContain("githubToken");
+    } finally {
+      const cleared = await api("PATCH", "/api/config", { botTasks: { githubToken: null } });
+      expect(cleared.status, cleared.body.error).toBe(200);
+      expect((await api("GET", "/api/config")).body.botTasks).toMatchObject({ credential: "vault", githubTokenSet: false });
+    }
   });
 
   it("stores OpenCode Go credentials as a configured-only status", async () => {

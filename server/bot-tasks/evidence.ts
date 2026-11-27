@@ -1,5 +1,7 @@
-import type { BotTaskEvidence, BotTaskGithubRef } from "../../shared/bot-tasks.ts";
+import type { BotTaskEvidence, BotTaskEvidenceClaim, BotTaskGithubRef, BotTasksSettings, BotTaskVerification } from "../../shared/bot-tasks.ts";
 import { REPO_PATTERN } from "../../shared/bot-tasks.ts";
+import { GithubError, type GithubClient } from "./github.ts";
+import { repoAllowed } from "./settings.ts";
 
 export class BotTaskError extends Error {
   readonly status: number;
@@ -14,15 +16,15 @@ export const EVIDENCE_EXAMPLE = 'Example: evidence [{"kind":"commit","sha":"<40-
 const SHA = /^[0-9a-f]{7,40}$/i;
 
 function httpsUrl(raw: unknown, what: string): URL {
-  if (typeof raw !== "string") throw new BotTaskError(400, `${what} needs a url. ${EVIDENCE_EXAMPLE}`);
+  if (typeof raw !== "string") throw new BotTaskError(400, `${what} needs a URL. ${EVIDENCE_EXAMPLE}`);
   let url: URL;
-  try { url = new URL(raw.trim()); } catch { throw new BotTaskError(400, `${what}: "${raw.slice(0, 80)}" is not a URL.`); }
+  try { url = new URL(raw.trim()); } catch { throw new BotTaskError(400, `${what} needs a valid URL.`); }
   if (url.protocol !== "https:" || url.username || url.password) throw new BotTaskError(400, `${what} must be a plain https URL.`);
   return url;
 }
 
 /** Checks one evidence item's shape. It proves that a claim names something checkable, not that the thing exists. */
-export function parseEvidence(raw: unknown): BotTaskEvidence {
+export function parseEvidence(raw: unknown): BotTaskEvidenceClaim {
   if (!raw || typeof raw !== "object") throw new BotTaskError(400, `Each evidence item is an object. ${EVIDENCE_EXAMPLE}`);
   const item = raw as Record<string, unknown>;
   switch (item.kind) {
@@ -54,7 +56,92 @@ export function parseEvidence(raw: unknown): BotTaskEvidence {
 
 /** A command that failed does not show the work is done. */
 export function supportsDone(items: readonly BotTaskEvidence[]): boolean {
-  return items.some((item) => item.kind !== "command" || item.exitCode === 0);
+  return items.some((item) => item.kind === "command" ? item.exitCode === 0 : item.verification?.status === "verified");
+}
+
+const ACTIONS = /^\/([\w.-]+\/[\w.-]+)\/actions\/runs\/(\d+)(?:\/job\/(\d+))?\/?$/;
+const DISCUSSION = /^\/([\w.-]+\/[\w.-]+)\/(pull|issues)\/(\d+)\/?$/;
+const ANCHOR = /^#(pullrequestreview|discussion_r|issuecomment)-?(\d+)$/;
+
+function reviewTarget(url: URL) {
+  const discussion = DISCUSSION.exec(url.pathname);
+  const anchor = ANCHOR.exec(url.hash);
+  if (!discussion || !anchor || url.origin !== "https://github.com") return;
+  const [, repo, kind, number] = discussion;
+  const [, type, id] = anchor;
+  if (type !== "issuecomment" && kind !== "pull") return;
+  const route = type === "pullrequestreview" ? `pulls/${number}/reviews` : type === "discussion_r" ? "pulls/comments" : "issues/comments";
+  return { repo: repo!, number: Number(number), type, id, route: `${route}/${id}` };
+}
+
+export async function verifyEvidence(
+  claim: BotTaskEvidenceClaim,
+  ref: BotTaskGithubRef | undefined,
+  settings: Pick<BotTasksSettings, "repos">,
+  lookup: GithubClient["lookupEvidence"] | undefined,
+  checkedAt: number,
+): Promise<BotTaskEvidence> {
+  const result = (status: BotTaskVerification["status"], detail: string): BotTaskEvidence =>
+    ({ ...claim, verification: { status, checkedAt, detail } });
+  if (claim.kind === "command") return result("unverifiable", `Recorded exit code ${claim.exitCode}.`);
+
+  const repo = ref?.repo ?? (claim.kind === "commit" ? claim.repo : undefined);
+  if (!repo || !REPO_PATTERN.test(repo) || !repoAllowed(settings, repo)) {
+    return result("unverifiable", "Evidence needs an allowed GitHub repository.");
+  }
+  const base = `/repos/${repo}`;
+  let path: string;
+  let what: string;
+  let review: ReturnType<typeof reviewTarget>;
+  let jobRun: string | undefined;
+  if (claim.kind === "commit") {
+    if (claim.repo && claim.repo.toLowerCase() !== repo.toLowerCase()) return result("failed", "Commit repository does not match the linked repository.");
+    path = `${base}/commits/${claim.sha}`;
+    what = `commit ${claim.sha}`;
+  } else if (claim.kind === "ci_run") {
+    const url = new URL(claim.url);
+    const run = ACTIONS.exec(url.pathname);
+    if (url.origin !== "https://github.com" || run?.[1]?.toLowerCase() !== repo.toLowerCase()) {
+      return result("failed", `CI evidence must be a GitHub Actions run or job in ${repo}.`);
+    }
+    path = run[3] ? `${base}/actions/jobs/${run[3]}` : `${base}/actions/runs/${run[2]}`;
+    if (run[3]) jobRun = run[2];
+    what = run[3] ? `CI job ${run[3]}` : `CI run ${run[2]}`;
+  } else {
+    review = reviewTarget(new URL(claim.url));
+    if (review?.repo.toLowerCase() !== repo.toLowerCase() || review.number !== ref?.number) {
+      return result("failed", "Review evidence must point to a review or comment on the linked GitHub item.");
+    }
+    path = `${base}/${review.route}`;
+    what = `GitHub review or comment ${review.id}`;
+  }
+
+  if (!lookup) return result("unverifiable", `No GitHub credential is usable to check ${what}.`);
+  try {
+    const answer = await lookup(path);
+    if (claim.kind === "commit" && !answer.sha?.toLowerCase().startsWith(claim.sha)) {
+      return result("unverifiable", `GitHub did not return the requested ${what} in ${repo}.`);
+    }
+    if (claim.kind === "ci_run") {
+      if (jobRun && String(answer.run_id) !== jobRun) return result("failed", `${what} does not belong to run ${jobRun}.`);
+      if (answer.status !== "completed") return result("unverifiable", `${what} has not finished.`);
+      if (answer.conclusion === "success") return result("verified", `${what} concluded with success.`);
+      const conclusion = /^[a-z_]{1,40}$/.test(answer.conclusion ?? "") ? answer.conclusion : "unknown";
+      return result("failed", `${what} concluded with ${conclusion}.`);
+    }
+    if (review) {
+      const actual = answer.html_url ? reviewTarget(new URL(answer.html_url)) : undefined;
+      if (actual?.repo.toLowerCase() !== review.repo.toLowerCase() || actual.number !== review.number ||
+        actual.type !== review.type || actual.id !== review.id) {
+        return result("failed", `${what} does not belong to the linked GitHub item.`);
+      }
+    }
+    return result("verified", `${what} exists in ${repo}.`);
+  } catch (error) {
+    if (error instanceof GithubError && error.status === 404) return result("failed", `${what} not found in ${repo}.`);
+    if (error instanceof GithubError && error.status === 401) return result("unverifiable", `No GitHub credential is usable to check ${what}.`);
+    return result("unverifiable", `GitHub could not confirm ${what} in ${repo}.`);
+  }
 }
 
 const REF_TEXT = /(?<![\w/.-])([A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100})#(\d{1,7})\b/g;

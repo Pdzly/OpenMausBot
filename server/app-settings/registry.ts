@@ -322,7 +322,7 @@ export function createSettingsRegistry(deps: RegistryDeps): SettingEntry[] {
 
   const ownerOnly = (id: string, label: string, help: string, where: Where, synonyms: string[], read: () => string): SettingEntry => ({ id, label, help, where, synonyms, tier: "owner-only", read });
   const owner: SettingEntry[] = [
-    ownerOnly("botTasks.githubAccess", "Bot tasks and GitHub", "Which GitHub credential bot tasks use (the gh CLI or a saved token), and whether bots may comment on or merge a pull request. Each is the person's own switch.", "page:bot-tasks",
+    ownerOnly("botTasks.githubAccess", "Bot tasks and GitHub", "Which GitHub credential bot tasks use (the gh CLI or a token sealed in the vault), and whether bots may comment on or merge a pull request. Each is the person's own switch.", "page:bot-tasks",
       ["github token", "github credential", "comment on github", "merge", "outbound", "post to github"], () => {
         const tasks = botTasksSettings(deps.cfg());
         return `credential ${tasks.credential}, comments on GitHub ${tasks.allowOutboundComments ? "allowed" : "off"}, merging ${tasks.allowMerge ? "allowed" : "off"}`;

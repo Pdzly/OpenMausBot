@@ -5,7 +5,6 @@ import type { AppConfig } from "../config.ts";
 import type { RequestAuth } from "../request-auth.ts";
 import { createBotTaskToolRoutes } from "../routes/bot-task-tools.ts";
 import { createBotTasksRoutes } from "../routes/bot-tasks.ts";
-import { BotTaskError } from "./evidence.ts";
 import { createGithubClient, resolveGithubToken } from "./github.ts";
 import { createBotTasks, type GithubPort } from "./service.ts";
 import { botTasksSettings } from "./settings.ts";
@@ -14,6 +13,7 @@ import { syncGithubTask } from "./sync.ts";
 export interface BotTasksHostDeps {
   dataDir: string;
   config(): AppConfig;
+  vaultToken(): string | null;
   botName(botId: string): string | undefined;
   bots(): ReadonlyArray<{ id: string; name: string }>;
   person(auth: RequestAuth): string;
@@ -28,13 +28,13 @@ const TICK_MS = 30_000;
 export function createBotTasksHost(deps: BotTasksHostDeps) {
   const now = deps.now ?? Date.now;
   const settings = (): BotTasksSettings => botTasksSettings(deps.config());
-  const token = async () => {
-    const found = await resolveGithubToken(settings().credential, deps.config().botTasks?.githubToken);
-    if (!found) throw new BotTaskError(503, "No GitHub credential is usable. Choose the gh CLI (signed in with gh auth login) or save a token in Settings → Bot tasks.");
-    return found;
+  const token = () => {
+    const { credential } = settings();
+    return resolveGithubToken(credential, credential === "vault" ? deps.vaultToken() : null);
   };
   const client = createGithubClient({ token, now });
   const port: GithubPort = {
+    lookupEvidence: client.lookupEvidence,
     async sync(task, since) {
       const result = await syncGithubTask({ task, client, now: now(), since });
       const activity = result.activity.filter((entry): entry is Exclude<typeof entry, { type: "github_ref" }> => entry.type !== "github_ref");

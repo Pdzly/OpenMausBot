@@ -1,6 +1,7 @@
 // The task list for the app (docs/bot-tasks.md). Admin sessions only: request-auth.ts does not list these paths for members.
 //   GET  /api/bot-tasks             { enabled, tasks } newest first; ?status=&bot=&repo=&q=
 //   GET  /api/bot-tasks/:id         { task, ownerName }
+// PATCH  /api/bot-tasks/:id         { status, evidence?, comment? } updates one task
 //   POST /api/bot-tasks/:id/sync    { ok, task } polls the linked pull request or issue now, even when polling is off
 //   POST /api/bot-tasks/:id/post    { ok, url, task } the person's own comment on GitHub, with merge: true to merge first
 import { z } from "zod";
@@ -14,10 +15,16 @@ import { PASS, type RouteHandler } from "./table.ts";
 export const BOT_TASKS_PATH = "/api/bot-tasks";
 
 export interface BotTasksRouteDeps {
-  tasks: Pick<BotTasks, "list" | "get" | "sync" | "post">;
+  tasks: Pick<BotTasks, "list" | "get" | "setStatus" | "sync" | "post">;
   enabled(): boolean;
   person(auth: RequestAuth): string;
 }
+
+const statusSchema = z.object({
+  status: z.enum(BOT_TASK_STATUSES),
+  evidence: z.array(z.unknown()).max(BOT_TASK_LIMITS.evidencePerMove).optional(),
+  comment: z.string().max(BOT_TASK_LIMITS.textMax).optional(),
+}).strict();
 
 const postSchema = z.object({ text: z.string().max(BOT_TASK_LIMITS.textMax), merge: z.boolean().optional() }).strict();
 
@@ -41,7 +48,13 @@ export function createBotTasksRoutes(deps: BotTasksRouteDeps): RouteHandler {
       if (!rawId || rest.length) return json(res, 404, { error: "not found" });
       const id = decodeURIComponent(rawId);
       if (!action) {
-        if (method !== "GET") return json(res, 405, { error: "Use GET." });
+        if (method === "PATCH") {
+          const parsed = statusSchema.safeParse(await readBody(req, 64_000).catch(() => null));
+          if (!parsed.success) return json(res, 400, { error: "Send a status, optional evidence and an optional comment." });
+          const task = await deps.tasks.setStatus(id, { ...parsed.data, by: { kind: "person", name: deps.person(auth) } });
+          return json(res, 200, { ok: true, task });
+        }
+        if (method !== "GET") return json(res, 405, { error: "Use GET or PATCH." });
         const { ownerName, ...task } = deps.tasks.get(id);
         return json(res, 200, { task, ownerName });
       }

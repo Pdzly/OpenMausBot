@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { z } from "zod";
 import type { ImageGenerationConfig } from "../shared/image-generation.ts";
-import { BOT_TASKS_POLL_MINUTES, REPO_PATTERN } from "../shared/bot-tasks.ts";
+import { BOT_TASKS_POLL_MINUTES, REPO_PATTERN, type BotTasksSettings } from "../shared/bot-tasks.ts";
 import { imageGenConfigSchema, imageGenPatchSchema, keepKeysOutOfImageModels, type ImageGenCredentialPatch } from "./image-generation-config.ts";
 import { botAvatarUrlSchema } from "../shared/bot-avatar.ts";
 import { writeFileAtomic } from "./atomic.ts";
@@ -286,14 +286,13 @@ const threadsPatchSchema = threadsConfigSchema.extend({
   eventLogMaxBytes: threadsConfigSchema.shape.eventLogMaxBytes.nullable(),
   eventLogRetentionDays: threadsConfigSchema.shape.eventLogRetentionDays.nullable(),
 });
-/** Bot tasks (docs/bot-tasks.md). Everything is off or at its safest unless set. `githubToken` is write-only. */
+/** Bot task settings. The GitHub token is held in the vault. */
 const botTasksConfigSchema = z.object({
   enabled: z.boolean().optional(),
   githubSync: z.boolean().optional(),
   pollMinutes: z.number().int().min(BOT_TASKS_POLL_MINUTES.min).max(BOT_TASKS_POLL_MINUTES.max).optional(),
   repos: z.array(z.string().trim().regex(REPO_PATTERN)).max(200).optional(),
-  credential: z.enum(["gh", "token"]).optional(),
-  githubToken: secretText,
+  credential: z.enum(["gh", "vault", "token"]).transform((value) => value === "token" ? "vault" as const : value).optional(),
   requireEvidenceForDone: z.boolean().optional(),
   requireEvidenceForReview: z.boolean().optional(),
   allowOutboundComments: z.boolean().optional(),
@@ -416,6 +415,8 @@ const appConfigSchema = z.object({
   mcpServers: z.record(z.string(), z.unknown()).optional(),
 });
 const storedAppConfigSchema = appConfigSchema.extend(helperStoredShape).extend({
+  botTasks: botTasksConfigSchema.extend({ githubToken: z.unknown().optional() })
+    .transform(({ githubToken: _legacy, ...settings }) => settings).optional(),
   vpsServers: storedVpsServersSchema,
   browserProfiles: storedBrowserProfilesSchema.optional(),
   /** Loose like mcpServers: a bad provider key is dropped later, never the whole file. */
@@ -438,7 +439,7 @@ export interface AppConfig extends HelperConfig {
   /** Off by default; one backup attempt only before any work starts. */
   automaticRecovery?: { enabled: boolean; backup?: ModelSelection };
   cacheKeepWarm?: { enabled: boolean; windowMinutes?: number };
-  botTasks?: { enabled?: boolean; githubSync?: boolean; pollMinutes?: number; repos?: string[]; credential?: "gh" | "token"; githubToken?: string; requireEvidenceForDone?: boolean; requireEvidenceForReview?: boolean; allowOutboundComments?: boolean; allowMerge?: boolean };
+  botTasks?: Partial<BotTasksSettings>;
   /** UI creation template. Saving it never mutates a bot or grants access. */
   newBotDefaults?: NewBotDefaults;
   newBots?: { effort?: EffortLevel };
@@ -890,8 +891,7 @@ export function onConfigSaved(listener: (before: JsonObject, after: JsonObject) 
 
 /** Secrets are never echoed back; callers report configured-or-not only. */
 export function saveConfig(
-  patch: Partial<Omit<AppConfig, "threads" | "newBots" | "imageGen" | "botTasks">> & {
-    botTasks?: z.output<typeof botTasksPatchSchema>;
+  patch: Partial<Omit<AppConfig, "threads" | "newBots" | "imageGen">> & {
     threads?: z.output<typeof threadsPatchSchema>;
     newBots?: z.output<typeof newBotsPatchSchema>;
     imageGen?: z.output<typeof imageGenPatchSchema>;
@@ -902,7 +902,7 @@ export function saveConfig(
   const read = readConfigFile(p);
   if (read.state === "unreadable" || read.state === "invalid") throw configSaveRefusal(read, p);
   const disk: JsonObject = read.state === "ok" ? read.value : {};
-  const checkedPatch = appConfigSchema.partial().extend({ threads: threadsPatchSchema.optional(), newBots: newBotsPatchSchema.optional(), imageGen: imageGenPatchSchema.optional(), botTasks: botTasksPatchSchema.optional() }).parse(patch);
+  const checkedPatch = appConfigSchema.partial().extend({ threads: threadsPatchSchema.optional(), newBots: newBotsPatchSchema.optional(), imageGen: imageGenPatchSchema.optional() }).parse(patch);
   const before = configSaveListeners.size ? structuredClone(disk) : disk;
   const keepImageModels = keepKeysOutOfImageModels(disk, checkedPatch.imageGen);
   const storedProfiles = storedBrowserProfilesSchema.safeParse(disk.browserProfiles);

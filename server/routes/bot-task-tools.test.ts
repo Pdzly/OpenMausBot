@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { BOT_TASKS_DEFAULTS, type BotTasksSettings } from "../../shared/bot-tasks.ts";
+import { GithubError } from "../bot-tasks/github.ts";
 import { createBotTasks, type GithubPort } from "../bot-tasks/service.ts";
 import { createBotTaskToolRoutes } from "./bot-task-tools.ts";
 import { createBotTasksRoutes } from "./bot-tasks.ts";
@@ -49,6 +50,7 @@ beforeEach(() => {
   bot = "lin";
   asked = true;
   github = {
+    lookupEvidence: vi.fn(async () => ({ sha: "abc1234" })),
     sync: vi.fn(async () => ({ ref: { repo: "Pdzly/OpenMausBot", number: 5, kind: "pull" as const }, githubState: { state: "open" as const }, activity: [{ key: "comment:1", at: Date.now(), by: { kind: "github" as const, login: "philipp" }, type: "github_comment" as const, text: "Please rebase" }] })),
     pull: vi.fn(async () => ({ kind: "pull" as const, state: "open" as const, mergeable: true })),
     postComment: vi.fn(async () => ({ id: 9, url: "https://github.com/Pdzly/OpenMausBot/pull/5#issuecomment-9" })),
@@ -97,6 +99,17 @@ describe("the bot task tools", () => {
     expect(text(await tool(tools, "get", { id }))).toContain("evidence: `pnpm test` exit 0");
   });
 
+  it("waits for GitHub evidence and keeps the owner when the move is blocked", async () => {
+    settings.githubSync = false;
+    github.lookupEvidence = vi.fn(async () => { throw new GithubError("missing", 404); });
+    const { tools, tasks } = make();
+    const id = /tsk_\w+/.exec(text(await tool(tools, "create", { title: "x", github: "Pdzly/OpenMausBot#5" })))![0];
+    const result = await tool(tools, "update", { id, status: "done", owner: "Pixel", evidence: [{ kind: "commit", sha: "abc1234" }] });
+    expect(result.status).toBe(422);
+    expect(text(result)).toBe("Blocked: commit abc1234 not found in Pdzly/OpenMausBot.");
+    expect(tasks.get(id)).toMatchObject({ ownerBotId: "lin", status: "open" });
+  });
+
   it("hands a task over by bot name and rejects an unknown bot", async () => {
     const { tools, tasks } = make();
     const id = /tsk_\w+/.exec(text(await tool(tools, "create", { title: "x", owner: "@pixel" })))![0];
@@ -109,7 +122,7 @@ describe("the bot task tools", () => {
     const id = /tsk_\w+/.exec(text(await tool(tools, "create", { title: "x" })))![0];
     expect(text(await tool(tools, "link", { id, ref: "https://github.com/Pdzly/OpenMausBot/pull/5" }))).toContain("linked to Pdzly/OpenMausBot#5");
     const got = text(await tool(tools, "get", { id, sync: true }));
-    expect(got).toContain("GitHub: 1 new entry");
+    expect(github.sync).toHaveBeenCalledWith(expect.objectContaining({ id }), 0);
     expect(got).toContain("philipp (GitHub) commented on GitHub: Please rebase");
     expect(text(await tool(tools, "get", { id, sync: true }))).toContain("GitHub: nothing new");
     settings = { ...settings, githubSync: false };
@@ -186,6 +199,24 @@ describe("the app's task routes", () => {
     expect(one.body.task.id).toBe(a.id);
     expect(await call(route, "GET", "/api/bot-tasks/tsk_missing")).toMatchObject({ status: 404 });
     expect(await call(route, "POST", "/api/bot-tasks")).toMatchObject({ status: 405 });
+  });
+
+  it("verifies REST status updates and returns evidence on the task and its status entry", async () => {
+    settings.githubSync = false;
+    const { route, tasks } = routes();
+    const { task: { id } } = tasks.create({ title: "x", ownerBotId: "lin", by: { kind: "system" }, github: "Pdzly/OpenMausBot#5" });
+    const path = `/api/bot-tasks/${id}`;
+    const evidence = [{ kind: "commit", sha: "abc1234" }];
+    expect(await call(route, "PATCH", path, { status: "done", evidence }, admin)).toMatchObject({
+      status: 200, body: { ok: true, task: { status: "done", evidence: [{ verification: { status: "verified" } }] } },
+    });
+    expect(await call(route, "GET", path, undefined, admin)).toMatchObject({
+      status: 200, body: { task: { activity: expect.arrayContaining([expect.objectContaining({
+        type: "status", by: { kind: "person", name: "Philipp" }, evidence: [{ kind: "commit", sha: "abc1234", verification: {
+          status: "verified", detail: "commit abc1234 exists in Pdzly/OpenMausBot.", checkedAt: expect.any(Number),
+        } }],
+      })]) } },
+    });
   });
 
   it("syncs on demand even with polling off", async () => {

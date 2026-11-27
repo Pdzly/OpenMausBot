@@ -23,8 +23,8 @@ describe("GitHub credentials", () => {
   it("uses the configured token or caches the shell-free gh lookup for 60 seconds", async () => {
     vi.useFakeTimers();
     const exec = vi.fn(async () => ({ stdout: ` ${token}\n` }));
-    await expect(resolveGithubToken("token", "  saved  ", { exec })).resolves.toBe("saved");
-    await expect(resolveGithubToken("token", undefined, { exec })).resolves.toBeNull();
+    await expect(resolveGithubToken("vault", "  saved  ", { exec })).resolves.toBe("saved");
+    await expect(resolveGithubToken("vault", undefined, { exec })).resolves.toBeNull();
     expect(exec).not.toHaveBeenCalled();
     await expect(Promise.all([
       resolveGithubToken("gh", undefined, { exec }),
@@ -108,13 +108,13 @@ describe("GitHub task client", () => {
     });
     const events = await fixture(fetch).events(ref, now);
     expect(events.map(({ key }) => key)).toEqual([
-      "check:test:abc:success", "comment:1", "comment:2", "comment:4", "review:1",
+      "comment:1", "comment:2", "review-comment:4", "review:1",
       `state:reopened:${Date.parse(recent)}`, "check:build:abc:success",
     ]);
     expect(events).toContainEqual(expect.objectContaining({
       key: "comment:1", text: "a".repeat(4000), login: "dev", url,
     }));
-    expect(events).toContainEqual(expect.objectContaining({ key: "comment:4", ownMarker: true }));
+    expect(events).toContainEqual(expect.objectContaining({ key: "review-comment:4", ownMarker: true }));
     expect(events).toContainEqual(expect.objectContaining({ key: "review:1", state: "APPROVED", text: "looks good" }));
     expect(fetch).toHaveBeenCalledTimes(8);
   });
@@ -151,6 +151,44 @@ describe("GitHub task client", () => {
     });
     await expect(fixture(fetch).events(ref, now)).resolves.toEqual([]);
     expect(fetch).toHaveBeenCalledTimes(8);
+  });
+
+  it("uses a bounded GET for evidence and a fixed GitHub API origin", async () => {
+    const fakeFetch = vi.fn<typeof globalThis.fetch>(async (input, init) => {
+      expect(String(input)).toBe(`${api}${repo}/commits/abc1234`);
+      expect(init).toMatchObject({ method: "GET", redirect: "error", signal: expect.any(AbortSignal) });
+      return Response.json({ sha: "abc1234" });
+    });
+    const client = fixture(fakeFetch);
+    await expect(client.lookupEvidence(`${repo}/commits/abc1234`)).resolves.toEqual({ sha: "abc1234" });
+    expect(fakeFetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("reads recent pages first for large historical collections and backfills previous-head checks", async () => {
+    const visited: number[] = [];
+    const fakeFetch = vi.fn<typeof globalThis.fetch>(async (input) => {
+      const endpoint = new URL(String(input));
+      const page = Number(endpoint.searchParams.get("page") ?? 1);
+      if (endpoint.pathname === pr) return Response.json(pull);
+      if (endpoint.pathname === `${pr}/commits`) return Response.json([{ sha: "older" }, { sha: "abc" }]);
+      if (endpoint.pathname === `${issue}/comments`) {
+        visited.push(page);
+        const target = `${api}${issue}/comments`;
+        const link = page === 1 ? `<${target}?page=2>; rel="next", <${target}?page=9>; rel="last"`
+          : `<${target}?page=${page - 1}>; rel="prev"`;
+        return Response.json([{ id: page, body: "comment", created_at: old, html_url: url }], { headers: { link } });
+      }
+      if (endpoint.pathname.endsWith("/check-runs")) {
+        const check_runs = endpoint.pathname.includes("/older/") ? [{
+          id: 77, name: "earlier build", status: "completed", conclusion: "success", completed_at: old, html_url: url,
+        }] : [];
+        return Response.json({ check_runs });
+      }
+      return Response.json([]);
+    });
+    const events = await fixture(fakeFetch).events(ref, 0);
+    expect(visited).toEqual([1, 9, 8, 7, 6]);
+    expect(events).toContainEqual(expect.objectContaining({ key: "check-run:77", at: Date.parse(old) }));
   });
 
   it("adds the marker to outbound comments and redacts credentials in merge results", async () => {

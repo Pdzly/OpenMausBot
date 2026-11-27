@@ -41,27 +41,30 @@ export async function syncGithubTask({
   const events = await client.events(ref, since, item);
   const githubState = { state: item.state, syncedAt: now };
   const seen = new Set(task.activity.map(({ key }) => key));
+  const legacyKeys = new Set(task.activity.map(({ key, at }) => `${key}:${at}`));
+  const legacyStates = new Set(task.activity.flatMap((entry) =>
+    entry.type === "github_state" && entry.url?.toLowerCase() === item.htmlUrl.toLowerCase() ? [entry.key] : []));
   const activity: GithubTaskActivity[] = [];
   function add(event: GithubEvent) {
-    if (seen.has(event.key)) return;
-    seen.add(event.key);
-    activity.push(toActivity(event));
+    const key = event.type === "state" ? `${ref.repo.toLowerCase()}#${ref.number}:${event.key}` : event.key;
+    if (seen.has(key) || (event.legacyKey && legacyKeys.has(`${event.legacyKey}:${event.at}`)) ||
+      (event.type === "state" && legacyStates.has(event.key))) return;
+    seen.add(key);
+    activity.push(toActivity({ ...event, key }));
   }
 
   for (const event of events) {
-    if (event.type === "state" || (event.type === "comment" && event.ownMarker)) continue;
+    if (event.at < since || (event.type === "comment" && event.ownMarker)) continue;
     add(event);
   }
   const previous = task.githubState;
   if (previous && previous.state !== item.state) {
     const state = item.state === "open" ? "reopened" : item.state;
-    const matching = events.filter((event) =>
-      event.type === "state" && event.state === state && event.at >= previous.syncedAt
-    ).reduce<GithubEvent | undefined>((latest, event) => !latest || latest.at < event.at ? event : latest, undefined);
+    const matching = events.some((event) => event.type === "state" && event.state === state && event.at >= previous.syncedAt);
     const closedAt = item.closedAt && Number.isFinite(Date.parse(item.closedAt)) ? item.closedAt : undefined;
     const key = state === "merged" ? "state:merged"
       : `state:${state}:${state === "closed" ? closedAt ?? new Date(now).toISOString() : now}`;
-    add(matching ?? {
+    if (!matching) add({
       type: "state", state, key, at: state === "closed" && closedAt ? Date.parse(closedAt) : now,
       login: "github", url: item.htmlUrl,
     });

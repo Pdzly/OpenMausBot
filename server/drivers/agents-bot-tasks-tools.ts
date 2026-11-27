@@ -18,7 +18,7 @@ export async function callBotTaskTool(name: string, args: Json, context: ToolCal
 const EVIDENCE = {
   type: "array",
   maxItems: 10,
-  description: "What backs the claim. One is enough: a commit, a CI run, a review or comment link, or a command with its exit code.",
+  description: "What backs the claim. One is enough: a verified commit, a successful GitHub Actions run or job, a verified review or comment link, or a recorded command with exit code 0.",
   items: {
     type: "object",
     additionalProperties: false,
@@ -26,7 +26,7 @@ const EVIDENCE = {
       kind: { type: "string", enum: ["commit", "ci_run", "review_url", "command"] },
       sha: { type: "string", description: "commit: the hash (7 to 40 hex)." },
       repo: { type: "string", description: "commit: owner/repo it is in." },
-      url: { type: "string", description: "ci_run: the run's https URL. review_url: the pull request, review or comment URL on github.com." },
+      url: { type: "string", description: "ci_run: the GitHub Actions run or job URL. review_url: the anchored review or comment URL on the linked GitHub item." },
       command: { type: "string", maxLength: 500, description: "command: what you ran." },
       exitCode: { type: "integer", description: "command: its exit code. Only 0 counts as proof of done." },
     },

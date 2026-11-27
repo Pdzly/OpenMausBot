@@ -17,8 +17,10 @@ task guidance, the task routes answer 404 and nothing polls GitHub.
 | GitHub ref | Optional `owner/repo#number`, a pull request or an issue. |
 | activity | An append-only log: notes, status changes with their evidence, owner changes, GitHub events, posts and sync problems. |
 
-The store is `bot-tasks.json` in the data folder (mode 0600, written atomically). A task keeps its newest 400 log entries,
-and the list holds up to 2000 tasks. A file that cannot be read starts an empty list rather than failing the app, and a copy (`bot-tasks.json.bad-<time>`) is kept before the next write replaces it; the same goes for records that do not parse.
+The store is `bot-tasks.json` in the data folder (mode 0600, written atomically). Each task keeps up to 400 log entries
+in timestamp order. At the limit, the oldest GitHub and sync-error entries go first, then the oldest local notes. If
+local structural entries alone fill the log, the oldest of those are dropped while the creation and current link stay.
+The list holds up to 2000 tasks. A file that cannot be read starts an empty list rather than failing the app, and a copy (`bot-tasks.json.bad-<time>`) is kept before the next write replaces it; the same goes for records that do not parse.
 
 ## Bot tools
 
@@ -38,50 +40,56 @@ The calling bot comes from the turn's capability, never from the arguments.
 
 ### Evidence
 
-Moving a task to `done` needs at least one item that backs the claim, and so does `review` when "Require evidence for
-review" is on. The tool refuses without it and answers with an example.
+By default, moving a task to `done` needs at least one qualifying item. Turn on "Require evidence for review" to apply
+the same rule to `review`. The server checks evidence supplied for `done` and for gated `review` moves.
 
 | `kind` | Fields | Notes |
 | --- | --- | --- |
-| `commit` | `sha` (7 to 40 hex), `repo?` | |
-| `ci_run` | `url` | https only, no credentials in the URL. |
-| `review_url` | `url` | A GitHub pull request or issue link, including comment anchors. |
-| `command` | `command`, `exitCode` | A non-zero exit code is recorded but does not count as proof for `done`. |
+| `commit` | `sha` (7 to 40 hex), `repo?` | GitHub confirms existence in the linked repository, or in the named allowed repository if the task is unlinked. This check establishes repository membership only. |
+| `ci_run` | `url` | A GitHub Actions run or job in the linked repository. Success counts as proof. A finished run or job with any other conclusion fails. A run or job still going is unverifiable. |
+| `review_url` | `url` | An anchored review, inline PR comment or issue comment on the linked GitHub item. |
+| `command` | `command`, `exitCode` | The server records the exit code as unverifiable. Exit code 0 counts as proof. |
 
-Evidence is checked for shape, not for truth: the app does not ask GitHub whether the commit or CI run exists. It makes
-a claim without proof impossible to record, and it puts the proof next to the claim for you to check. Cancelling, blocking
-and reopening need none.
+Every failed check blocks the move and reports what went wrong. Missing credentials, an unreachable API and GitHub
+claims outside the repository allowlist are unverifiable and cannot satisfy the evidence requirement. A GitHub 404
+is treated as missing, including when GitHub masks a private resource with a 404. A move accepts up to 10 items and makes
+at most one short, read-only GitHub request per item. On success the task and its status entry carry the evidence and the
+server's verification status, timestamp and detail. Cancelling, blocking and reopening need no evidence.
 
 ## GitHub sync (inbound)
 
-For tasks with a GitHub ref, the app polls every "Poll interval" minutes (default 5, 1 to 1440) and on demand ("Sync now"
-in the task, or `task_get` with `sync: true`). It appends to the log:
+When GitHub sync is on, linking a task starts a backfill. The first successful sync also backfills existing links and
+records GitHub timestamps. The app then polls every "Poll interval" minutes (default 5, 1 to 1440). You can also sync on
+demand using "Sync now" in the task or `task_get` with `sync: true`. The log includes the following.
 
-- comments from other people (from the moment the task was linked; earlier discussion is not imported),
+- comments from other people,
 - reviews with their state,
 - CI and check results,
 - merged, closed and reopened events.
 
-Each event has a key (the comment id, the check run id, ...), and a poll adds only keys it has not seen, so nothing
-repeats. A comment the app posted itself carries a hidden marker with the task id and is recognised, not imported again.
+Events older than the link carry `imported: true` and sort by their original GitHub timestamp. At most five GitHub pages
+are read per endpoint, prioritizing recent pages when GitHub provides a last-page link. The first sync fetches checks
+on the PR head and up to three earlier PR commits returned by GitHub. Polls deduplicate events by key. The app recognizes
+its own posted comments by their hidden marker and skips them.
 Only repositories on the allowlist are synced; an empty allowlist syncs none. A failing sync adds one `sync_error` line
 (not one per poll) and the next poll tries again.
 
-Linking is automatic when a task's title or text names `owner/repo#n` or a github.com pull request / issue link: the
-first one is attached when the task is opened, and a bot that writes one later in a note is told which task it may link.
-Nothing is attached from a note without the bot's `task_link_github`.
+A title, note or status update that names exactly one GitHub item can link it automatically if the task has no link yet.
+When the text names several items, use `task_link_github` to choose one.
 
 ### Credential
 
 Settings → Bot tasks → GitHub credential:
 
 - **gh CLI** (default): the app runs `gh auth token` and keeps the answer for a minute. Nothing is stored. `gh` must be on the server's `PATH` and signed in as the user the server runs as; otherwise a sync records "GitHub token missing or invalid" and the token option is the way out.
-- **Token saved in the app**: a personal access token you paste. It is kept in `config.json` (mode 0600, the same place
-  as the app's other secrets), never sent back to the app (Settings only learns that one is set), never shown to bots
-  and removed from error messages.
+- **Vault token** (`credential: "vault"`). A personal access token sealed in a dedicated server vault slot. Settings
+  exposes only `githubTokenSet`. The slot is separate from GitHub sign-in and from secrets shared with bots.
+  On upgrade, the vault write must succeed before the server clears the legacy token from `config.json`. Older config
+  backups may still contain their original plaintext tokens.
 
 Inbound sync needs read access to the repositories (a fine-grained token with Pull requests, Issues and Checks read,
-or `gh` signed in with `repo` read). Posting a comment needs write access to that repository's issues or pull requests.
+or `gh` signed in with repository access). Evidence verification also needs Contents read for commits and Actions read
+for runs and jobs. Posting a comment needs write access to that repository's issues or pull requests.
 
 ## Outbound to GitHub (only when you ask)
 
@@ -143,8 +151,16 @@ evidence rather than a statement when they finish, keep notes in the app, link a
 | --- | --- |
 | `GET /api/bot-tasks` | `{ enabled, tasks }`, with `?status=&bot=&repo=&q=`. |
 | `GET /api/bot-tasks/:id` | One task with its log and its owner's name. |
+| `PATCH /api/bot-tasks/:id` | `{ status, evidence?, comment? }` verifies the move and returns `{ ok: true, task }`. |
 | `POST /api/bot-tasks/:id/sync` | Sync now, even when polling is off. |
 | `POST /api/bot-tasks/:id/post` | `{ text, merge? }`: your own post, subject to the two switches. |
+
+The config read model returns `botTasks.credential` (`"gh"` or `"vault"`) and `botTasks.githubTokenSet`.
+Send `{ botTasks: { githubToken: "…" } }` to `PATCH /api/config` to set the token, or use `null` to clear it.
+
+Full task responses expose status evidence in `task.evidence` and in the corresponding status entry in `task.activity`.
+Checked claims include `verification: { status, checkedAt, detail? }`, where `checkedAt` is a Unix time in milliseconds.
+Backfilled entries carry `imported: true` and use the original GitHub time in `at`.
 
 Bots reach the same service through the agents tool server (`/api/internal/bot-tasks/*`), which needs a turn capability.
 

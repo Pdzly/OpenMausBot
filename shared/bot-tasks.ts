@@ -75,11 +75,13 @@ export interface BotTask {
   updatedAt: number;
   github?: BotTaskGithubRef;
   /** The last GitHub state seen by a sync; used only to show it and to detect changes. */
-  githubState?: { state: "open" | "closed" | "merged"; syncedAt: number };
+  githubState?: { state: "open" | "closed" | "merged"; syncedAt: number; historyBackfilled?: true };
+  /** Evidence attached to the current status. */
+  evidence?: BotTaskEvidence[];
   activity: BotTaskActivity[];
 }
 
-export interface BotTaskSummary extends Omit<BotTask, "activity"> {
+export interface BotTaskSummary extends Omit<BotTask, "activity" | "evidence"> {
   ownerName: string;
   activityCount: number;
 }

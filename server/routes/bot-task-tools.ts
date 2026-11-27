@@ -66,7 +66,11 @@ function activityLine(entry: BotTaskActivity, now: number): string {
     case "created": return `${head}: created the task`;
     case "comment": return `${head}: ${oneLine(entry.text, 400)}`;
     case "status": {
-      const proof = entry.evidence?.map((item) => item.kind === "commit" ? `commit ${item.sha.slice(0, 12)}` : item.kind === "command" ? `\`${oneLine(item.command, 80)}\` exit ${item.exitCode}` : item.url).join("; ");
+      const proof = entry.evidence?.map((item) => {
+        const claim = item.kind === "commit" ? `commit ${item.sha.slice(0, 12)}`
+          : item.kind === "command" ? `\`${oneLine(item.command, 80)}\` exit ${item.exitCode}` : item.url;
+        return item.verification ? `${claim} [${item.verification.status}]` : claim;
+      }).join("; ");
       return `${head}: ${entry.from} → ${entry.to}${proof ? ` (evidence: ${proof})` : ""}`;
     }
     case "owner": return `${head}: handed over to ${entry.to}`;
@@ -118,10 +122,12 @@ export function createBotTaskToolRoutes(deps: BotTaskToolDeps): RouteHandler {
       case "update": {
         const body = updateSchema.parse(raw);
         if (body.status === undefined && body.owner === undefined) throw new BotTaskError(400, USAGE.update!);
-        let task: BotTask | undefined;
-        if (body.owner?.trim()) task = deps.tasks.setOwner(body.id, resolveBot(body.owner), by);
-        if (body.status) task = deps.tasks.setStatus(body.id, { status: body.status, ...(body.evidence ? { evidence: body.evidence } : {}), ...(body.comment ? { comment: body.comment } : {}), by });
-        return { status: 200, text: `${task!.id} is now ${task!.status}, owned by ${deps.botName(task!.ownerBotId) ?? task!.ownerBotId}.` };
+        const ownerBotId = body.owner?.trim() ? resolveBot(body.owner) : undefined;
+        if (body.status === undefined && ownerBotId === undefined) throw new BotTaskError(400, USAGE.update!);
+        const task = body.status
+          ? await deps.tasks.setStatus(body.id, { status: body.status, evidence: body.evidence, comment: body.comment, ownerBotId, by })
+          : deps.tasks.setOwner(body.id, ownerBotId!, by);
+        return { status: 200, text: `${task.id} is now ${task.status}, owned by ${deps.botName(task.ownerBotId) ?? task.ownerBotId}.` };
       }
       case "comment": {
         const body = commentSchema.parse(raw);
@@ -131,7 +137,7 @@ export function createBotTaskToolRoutes(deps: BotTaskToolDeps): RouteHandler {
       case "link": {
         const body = linkSchema.parse(raw);
         const task = deps.tasks.linkGithub(body.id, body.ref, by);
-        return { status: 200, text: `${task.id} is linked to ${refLabel(task.github!)}.${deps.settings().githubSync ? " The app follows its comments, reviews, checks and merge." : " GitHub sync is off in Settings, so nothing is imported until it is turned on."}` };
+        return { status: 200, text: `${task.id} is linked to ${refLabel(task.github!)}.${deps.settings().githubSync ? " The app backfills its history and follows new GitHub activity." : " GitHub sync is off in Settings, so nothing is imported until it is turned on."}` };
       }
       case "list": {
         const body = listSchema.parse(raw ?? {});
