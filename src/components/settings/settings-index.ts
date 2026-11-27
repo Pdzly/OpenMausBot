@@ -54,10 +54,10 @@ const browserAdmin = (ctx: SettingsContext) => !ctx.desktop && ctx.admin;
 const adminPage = (ctx: SettingsContext) => !ctx.client && !(ctx.team && !ctx.admin);
 /** A page Simple mode leaves out: its everyday rows show elsewhere in Simple (Overview, This app, Plan & billing). */
 const advancedOnly = (when: (ctx: SettingsContext) => boolean) => (ctx: SettingsContext) => ctx.advanced && when(ctx);
-/** Simple mode's eleven entries: the place (Overview, Devices, AI, Vault, Spending, Import & export, Storage on a Cloud,
- * and Features), Your account (Plan & billing) and This app (Appearance). Advanced adds You and your bots, Desktops & browser,
- * Data, Bot tasks and General. */
-export const ADVANCED_PAGES: readonly SettingsPageId[] = ["bots", "desktops", "data", "general", "bot-tasks"];
+/** Simple mode's twelve entries: the place (Overview, Devices, AI, Vault, Spending, Import & export, Storage on a Cloud,
+ * Features and, to an admin, Bot tasks), Your account (Plan & billing) and This app (Appearance). Advanced adds You and your bots, Desktops & browser,
+ * Data and General. Bot tasks shows in both, to an admin. */
+export const ADVANCED_PAGES: readonly SettingsPageId[] = ["bots", "desktops", "data", "general"];
 
 export const SETTINGS_PAGES: readonly SettingsPage[] = [
   { id: "overview", owner: "place", labelKey: "settings.page.overview", synonyms: ["overview", "place", "status", "version", "domain", "address", "sidebar"], when: () => true },
@@ -88,7 +88,7 @@ export const SETTINGS_PAGES: readonly SettingsPage[] = [
     synonyms: ["installations", "fleet", "clients", "tenants"] },
   { id: "features", owner: "place", labelKey: "settings.page.features", icon: ToggleRight, when: adminPage,
     synonyms: ["features", "turn off", "turn on", "hide", "skill burger", "skill burgers", "tabs", "thread tabs"] },
-  { id: "bot-tasks", owner: "place", labelKey: "settings.page.botTasks", icon: ListTodo, when: advancedOnly(adminPage),
+  { id: "bot-tasks", owner: "place", labelKey: "settings.page.botTasks", icon: ListTodo, when: adminPage,
     synonyms: ["bot tasks", "tasks", "task list", "ledger", "github", "pull requests", "issues", "evidence", "sync"] },
   { id: "account", owner: "account", labelKey: "settings.page.account", when: () => true,
     synonyms: ["account", "sign in", "log in", "log out", "sign out", "email", "organization", "mausbot cloud"] },

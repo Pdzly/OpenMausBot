@@ -110,13 +110,13 @@ export function BotTasksSettingsView({ settings, save }: BotTasksSettingsViewPro
           </SettingsFormFoot>
           <SettingRow title={t("settings.botTasks.credential")} message={errorFor("credential")}>
             <Segmented label={t("settings.botTasks.credential")} value={settings.credential} disabled={!sync || pending !== null}
-              options={[{ value: "gh", label: t("settings.botTasks.credentialGh") }, { value: "token", label: t("settings.botTasks.credentialToken") }]}
+              options={[{ value: "gh", label: t("settings.botTasks.credentialGh") }, { value: "vault", label: t("settings.botTasks.credentialVault") }]}
               onChange={(credential) => { if (credential !== settings.credential) void send("credential", { credential }); }} />
           </SettingRow>
-          {settings.credential === "token" && (
+          {settings.credential === "vault" && (
             <>
               <div className="flex flex-col gap-2 px-4 pb-1 pt-3" data-bot-tasks-token="">
-                <SettingsField label={t("settings.botTasks.token")}>
+                <SettingsField label={t("settings.botTasks.token")} hint={t("settings.botTasks.tokenLine")}>
                   <input type="password" value={token} autoComplete="off" spellCheck={false} disabled={!sync || pending !== null}
                     placeholder={settings.githubTokenSet ? t("settings.botTasks.tokenReplace") : t("settings.botTasks.tokenPlaceholder")}
                     onChange={(event) => setToken(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && token.trim()) void saveToken(token.trim()); }}
