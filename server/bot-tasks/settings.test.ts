@@ -38,11 +38,22 @@ describe("bot task GitHub settings", () => {
     expect(new VaultStore({ dataDir: dir }).botTasksGithubToken()).toBe(token);
   });
 
+  it("strips a restored legacy token without replacing the current vault token", () => {
+    const path = join(dir, "config.json");
+    writeFileSync(path, JSON.stringify({ botTasks: { credential: "token", githubToken: token } }));
+    const vault = new VaultStore({ dataDir: dir });
+    vault.setBotTasksGithubToken("fixture-new-token");
+    migrateBotTasksGithubToken(dir, vault);
+    expect(vault.botTasksGithubToken()).toBe("fixture-new-token");
+    expect(JSON.parse(readFileSync(path, "utf8"))).toEqual({ botTasks: { credential: "vault" } });
+  });
+
   it("leaves the config byte-for-byte intact when the vault write fails", () => {
     const path = join(dir, "config.json");
     const legacy = JSON.stringify({ botTasks: { credential: "token", githubToken: token } });
     writeFileSync(path, legacy);
     expect(() => migrateBotTasksGithubToken(dir, {
+      botTasksGithubToken: () => null,
       setBotTasksGithubToken: () => { throw new Error("vault write failed"); },
     })).toThrow("vault write failed");
     expect(readFileSync(path, "utf8")).toBe(legacy);

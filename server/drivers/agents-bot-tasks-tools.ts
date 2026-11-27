@@ -4,10 +4,10 @@ import { BOT_TASK_STATUSES } from "../../shared/bot-tasks.ts";
 import type { ToolCallContext, ToolCallResult } from "./agents-call.ts";
 import type { Json } from "./agents-client.ts";
 
-export const BOT_TASK_TOOL_NAMES: ReadonlySet<string> = new Set(["task_create", "task_update", "task_comment", "task_link_github", "task_list", "task_get", "task_post_github"]);
+export const BOT_TASK_TOOL_NAMES: ReadonlySet<string> = new Set(["task_create", "task_update", "task_comment", "task_link_github", "task_list", "task_get"]);
 
 const PATHS: Record<string, string> = {
-  task_create: "create", task_update: "update", task_comment: "comment", task_link_github: "link", task_list: "list", task_get: "get", task_post_github: "post",
+  task_create: "create", task_update: "update", task_comment: "comment", task_link_github: "link", task_list: "list", task_get: "get",
 };
 
 export async function callBotTaskTool(name: string, args: Json, context: ToolCallContext): Promise<ToolCallResult> {
@@ -108,20 +108,6 @@ export const BOT_TASK_TOOL_DEFINITIONS = [
       additionalProperties: false,
       properties: { id: { type: "string" }, sync: { type: "boolean", description: "Poll the linked pull request or issue now." } },
       required: ["id"],
-    },
-  },
-  {
-    name: "task_post_github",
-    description: "Post ONE comment to the task's GitHub pull request or issue, and merge it only with merge. Only when the person you are working for asked for it in this conversation (\"post it to GitHub\", \"merge and comment\"). Refused unless Settings allows it.",
-    inputSchema: {
-      type: "object",
-      additionalProperties: false,
-      properties: {
-        id: { type: "string" },
-        text: { type: "string", maxLength: 4000, description: "The comment: what was done, with the evidence." },
-        merge: { type: "boolean", description: "Merge the pull request first. Only on an explicit request, and only when Settings allows merging." },
-      },
-      required: ["id", "text"],
     },
   },
 ];

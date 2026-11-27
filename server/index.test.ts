@@ -13237,6 +13237,27 @@ describe("harness HTTP API", () => {
     }
   });
 
+  it("hides enabled bot tasks from a client-only session", async () => {
+    expect((await api("PATCH", "/api/config", { botTasks: { enabled: true } })).status).toBe(200);
+    try {
+      expect((await api("GET", "/api/config")).body.botTasks.enabled).toBe(true);
+      const pairing = await api("POST", "/api/auth/pairing", { scopes: ["client"] });
+      const paired = await fetch(`${BASE}/api/auth/pair`, {
+        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ code: pairing.body.code }),
+      });
+      expect(paired.status).toBe(200);
+      const { token } = (await paired.json()) as { token: string };
+      const headers = { authorization: `Bearer ${token}` };
+      const config = await fetch(`${BASE}/api/config`, { headers });
+      expect(config.status).toBe(200);
+      const view = await config.json() as { botTasks: unknown };
+      expect(view.botTasks).toMatchObject({ enabled: false, repos: [], githubTokenSet: false });
+      expect((await fetch(`${BASE}/api/bot-tasks`, { headers })).status).toBe(403);
+    } finally {
+      expect((await api("PATCH", "/api/config", { botTasks: { enabled: false } })).status).toBe(200);
+    }
+  });
+
   it("stores OpenCode Go credentials as a configured-only status", async () => {
     const put = await api("PUT", "/api/config", { opencodeGo: { apiKey: "opencode-secret" } });
     expect(put.status).toBe(200);

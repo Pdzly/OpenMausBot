@@ -153,6 +153,18 @@ describe("GitHub task client", () => {
     expect(fetch).toHaveBeenCalledTimes(8);
   });
 
+  it("reads the linked pull request's commit list across pages for evidence", async () => {
+    const fakeFetch = vi.fn<typeof globalThis.fetch>(async (input) => {
+      const endpoint = new URL(String(input));
+      if (endpoint.pathname === pr) return Response.json(pull);
+      expect(endpoint.pathname).toBe(`${pr}/commits`);
+      if (endpoint.searchParams.get("page") === "2") return Response.json([{ sha: "second" }]);
+      return Response.json([{ sha: "first" }], { headers: { link: '<?page=2>; rel="next"' } });
+    });
+    await expect(fixture(fakeFetch).pullCommitEvidence(ref)).resolves.toEqual({ shas: ["first", "second"], complete: true });
+    expect(fakeFetch).toHaveBeenCalledTimes(3);
+  });
+
   it("uses a bounded GET for evidence and a fixed GitHub API origin", async () => {
     const fakeFetch = vi.fn<typeof globalThis.fetch>(async (input, init) => {
       expect(String(input)).toBe(`${api}${repo}/commits/abc1234`);
@@ -200,12 +212,12 @@ describe("GitHub task client", () => {
       }
       expect(String(input)).toBe(`${api}${pr}/merge`);
       expect(init?.method).toBe("PUT");
-      expect(JSON.parse(String(init?.body))).toEqual({ merge_method: "squash" });
+      expect(JSON.parse(String(init?.body))).toEqual({ sha: "a".repeat(40), merge_method: "squash" });
       return Response.json({ merged: true, sha: "def", message: `Done ${token}` });
     });
     const client = fixture(fetch);
     await expect(client.postComment({ ...ref, taskId: "task-42" }, "Update")).resolves.toEqual({ id: 5, url });
-    await expect(client.merge(ref, { method: "squash" })).resolves.toEqual({
+    await expect(client.merge(ref, { sha: "a".repeat(40), method: "squash" })).resolves.toEqual({
       merged: true, sha: "def", message: "Done [REDACTED]",
     });
   });

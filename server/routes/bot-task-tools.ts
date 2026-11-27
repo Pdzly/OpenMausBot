@@ -1,9 +1,9 @@
-// The bot task tools (task_create, task_update, task_comment, task_link_github, task_list, task_get, task_post_github),
+// The bot task tools (task_create, task_update, task_comment, task_link_github, task_list, task_get),
 // inside index.ts's /api/internal/ block after the capability bearer is checked: the bot and its thread are the
 // capability's, never a body field. Answer 404 while Settings → Bot tasks is off.
 //   POST /api/internal/bot-tasks/{create,update,comment,link,list,get,post}
 // Security: the evidence rule and the Settings switches are enforced by the service (server/bot-tasks/service.ts), not
-// here; `post` is the only outbound path and also needs a person's own request in this turn (`personAsked`).
+// here.
 import { z } from "zod";
 
 import { BOT_TASK_LIMITS, BOT_TASK_STATUSES, type BotTask, type BotTaskActivity, type BotTaskActor, type BotTaskGithubRef, type BotTasksSettings, type BotTaskSummary } from "../../shared/bot-tasks.ts";
@@ -14,7 +14,7 @@ import { PASS, type RouteHandler } from "./table.ts";
 export const BOT_TASK_TOOL_PATH = "/api/internal/bot-tasks";
 
 export interface BotTaskToolDeps {
-  tasks: Pick<BotTasks, "create" | "comment" | "setStatus" | "setOwner" | "linkGithub" | "list" | "get" | "sync" | "post">;
+  tasks: Pick<BotTasks, "create" | "comment" | "setStatus" | "setOwner" | "linkGithub" | "list" | "get" | "sync">;
   settings(): BotTasksSettings;
   requireActive(): void;
   botId(): string;
@@ -22,8 +22,6 @@ export interface BotTaskToolDeps {
   botName(botId: string): string | undefined;
   /** Every bot a task can be handed to. */
   bots(): ReadonlyArray<{ id: string; name: string }>;
-  /** This turn began with a person's own message, not a routine, a wake-up or another bot. */
-  personAsked(): boolean;
 }
 
 const text = (max: number) => z.string().max(max);
@@ -36,7 +34,6 @@ const commentSchema = z.object({ id: text(100), text: text(BOT_TASK_LIMITS.textM
 const linkSchema = z.object({ id: text(100), ref: text(300) }).strict();
 const listSchema = z.object({ status: z.enum(BOT_TASK_STATUSES).optional(), mine: z.boolean().optional(), repo: text(200).optional(), query: text(200).optional() }).strict();
 const getSchema = z.object({ id: text(100), sync: z.boolean().optional() }).strict();
-const postSchema = z.object({ id: text(100), text: text(BOT_TASK_LIMITS.textMax), merge: z.boolean().optional() }).strict();
 
 const USAGE: Record<string, string> = {
   create: 'task_create takes title, text?, github? and owner?. Example: {"title":"Fix the scan crash","github":"owner/repo#12"}',
@@ -45,7 +42,6 @@ const USAGE: Record<string, string> = {
   link: 'task_link_github takes id and ref. Example: {"id":"t_1","ref":"owner/repo#12"}',
   list: "task_list takes status?, mine?, repo? and query?.",
   get: "task_get takes id and sync?.",
-  post: 'task_post_github takes id, text and merge?. Example: {"id":"t_1","text":"Fixed in abc1234, CI is green."}',
 };
 
 const oneLine = (value: string, max: number) => {
@@ -160,12 +156,6 @@ export function createBotTaskToolRoutes(deps: BotTaskToolDeps): RouteHandler {
         const log = task.activity.slice(-40).map((entry) => `  ${activityLine(entry, now)}`);
         const hidden = task.activity.length - log.length;
         return { status: 200, text: `${note}${taskHead(task, task.ownerName)}\nLog${hidden > 0 ? ` (last ${log.length} of ${task.activity.length})` : ""}:\n${log.join("\n")}` };
-      }
-      case "post": {
-        const body = postSchema.parse(raw);
-        if (!deps.personAsked()) throw new BotTaskError(403, "A comment on GitHub needs a person's own request in this conversation. Nothing was posted. Ask the person, then try again in the turn they answer.");
-        const result = await deps.tasks.post(body.id, { text: body.text, ...(body.merge ? { merge: true } : {}), by });
-        return { status: 200, text: `${result.merged ? "Merged and commented" : "Commented"}: ${result.url}` };
       }
       default:
         throw new BotTaskError(404, "not found");

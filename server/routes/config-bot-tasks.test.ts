@@ -14,16 +14,20 @@ describe("bot task GitHub access", () => {
   it.each([
     { auth: { kind: "loopback", trust: "service", scopes: [] }, cloudTeam: false },
     { auth: cloudAdmin, cloudTeam: true },
-  ])("rejects unauthorized token updates before reaching the vault", async ({ auth, cloudTeam }) => {
+  ])("rejects unauthorized security settings changes", async ({ auth, cloudTeam }) => {
     const setBotTasksGithubToken = vi.fn();
     const route = createConfigRoutes({ cloudTeam, botTasksVault: { setBotTasksGithubToken } } as unknown as ConfigRouteDeps);
     const json = vi.fn();
-    await route({
-      req: {}, res: {}, url: new URL("http://host/api/config"), path: "/api/config", method: "PATCH", auth,
-      json, readBody: async () => ({ botTasks: { githubToken: "fixture-token" } }),
-    } as unknown as Parameters<typeof route>[0]);
+    for (const botTasks of [
+      { githubToken: "fixture-token" }, { repos: ["org/repo"] }, { requireEvidenceForDone: false }, { requireEvidenceForReview: false },
+    ]) {
+      await route({
+        req: {}, res: {}, url: new URL("http://host/api/config"), path: "/api/config", method: "PATCH", auth,
+        json, readBody: async () => ({ botTasks }),
+      } as unknown as Parameters<typeof route>[0]);
+    }
 
-    expect(json).toHaveBeenCalledWith(expect.anything(), 403, { error: "Only the owner can change GitHub access for bot tasks." });
+    expect(json.mock.calls).toEqual(Array(4).fill([expect.anything(), 403, { error: "Only the owner can change GitHub access for bot tasks." }]));
     expect(setBotTasksGithubToken).not.toHaveBeenCalled();
   });
 });

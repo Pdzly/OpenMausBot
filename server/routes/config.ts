@@ -155,7 +155,8 @@ export function createConfigRoutes(deps: ConfigRouteDeps): RouteHandler {
       const { botTasks, ...otherSettings } = parseConfigPatchForPerson(body);
       const { githubToken, ...taskSettings } = botTasks ?? {};
       const patch = { ...otherSettings, ...(Object.keys(taskSettings).length ? { botTasks: taskSettings } : {}) };
-      if ((githubToken !== undefined || taskSettings.credential !== undefined || taskSettings.allowOutboundComments !== undefined || taskSettings.allowMerge !== undefined)
+      if ((githubToken !== undefined || taskSettings.credential !== undefined || taskSettings.allowOutboundComments !== undefined || taskSettings.allowMerge !== undefined ||
+        taskSettings.repos !== undefined || taskSettings.requireEvidenceForDone !== undefined || taskSettings.requireEvidenceForReview !== undefined)
         && (!ownerOrAdmin(auth) || (deps.cloudTeam && !(auth.kind === "session" && auth.session.teamRole === "owner")))) {
         return json(res, 403, { error: "Only the owner can change GitHub access for bot tasks." });
       }

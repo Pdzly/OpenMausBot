@@ -62,6 +62,46 @@ describe("live bot tasks", () => {
     expect([...host.querySelectorAll<HTMLElement>("[data-bot-task-row]")].map((row) => row.dataset.botTaskRow)).toEqual(["t1", "t2"]);
   });
 
+  it("submits the same link and head that were held by the merge confirmation", async () => {
+    let number = 5;
+    const sha = "a".repeat(40);
+    const posted = vi.fn();
+    const task = () => ({ ...summary("t1", title), github: { repo: "org/repo", number, kind: "pull" }, activity: [] });
+    vi.stubGlobal("fetch", (input: string, { body }: RequestInit = {}) => {
+      const path = String(input);
+      if (path.includes("/merge-head?")) return json({ sha });
+      if (path.endsWith("/post")) {
+        posted(JSON.parse(String(body)));
+        return json({ url: "https://github.com/org/repo/pull/5#issuecomment-1", task: task() });
+      }
+      return json({ task: task(), ownerName: "Lin" });
+    });
+    const enabled = { ...settings, githubSync: true, allowOutboundComments: true, allowMerge: true };
+    flushSync(() => root.render(createElement(BotTaskDetail, { id: "t1", settings: enabled, botName: (id: string) => id, onChanged: () => {} })));
+    await settle();
+    host.querySelector<HTMLButtonElement>("[data-bot-task-compose]")!.click();
+    await settle();
+    const textarea = host.querySelector("textarea")!;
+    Object.getOwnPropertyDescriptor(Object.getPrototypeOf(textarea), "value")!.set!.call(textarea, "Confirmed comment");
+    textarea.dispatchEvent(new Event("input", { bubbles: true }));
+    host.querySelector<HTMLInputElement>('input[type="checkbox"]')!.click();
+    await settle();
+    host.querySelector<HTMLButtonElement>("[data-bot-task-post-send]")!.click();
+    await settle();
+    const dialog = document.querySelector('[role="alertdialog"]')!;
+    expect(dialog.textContent).toContain("org/repo#5");
+    expect(dialog.querySelector("code")?.textContent).toBe(sha.slice(0, 12));
+    number = 6;
+    announceBotTask("t1");
+    await settle();
+    expect(dialog.textContent).toContain("org/repo#5");
+    [...dialog.querySelectorAll("button")].at(-1)!.click();
+    await settle();
+    expect(posted).toHaveBeenCalledExactlyOnceWith({
+      text: "Confirmed comment", expectedRef: { repo: "org/repo", number: 5 }, merge: true, sha,
+    });
+  });
+
   it("reloads the open task only for its own id", async () => {
     flushSync(() => root.render(createElement(BotTaskDetail, { id: "t1", settings, botName: (id: string) => id, onChanged: () => {} })));
     await settle();

@@ -3,7 +3,13 @@
 Work is paused on branch `feat/bot-tasks` in the fork Pdzly/OpenMausBot. No pull request is open yet. Nothing was pushed to
 upstream (milind-soni/OpenMausBot). Argus has NOT reviewed this branch.
 
-## Where things stand per spec point
+## PR notes from the review follow-up
+
+A command with exit code 0 can satisfy the requirement as self-reported evidence. It is not independently verified.
+Posting and merging are direct administrator actions in the task view. The confirmation pins the displayed GitHub item
+and, when merging, the PR head SHA.
+
+## Original handoff status per spec point
 
 | # | Spec point | State |
 | --- | --- | --- |

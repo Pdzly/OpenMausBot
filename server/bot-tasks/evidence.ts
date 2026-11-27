@@ -1,13 +1,16 @@
 import type { BotTaskEvidence, BotTaskEvidenceClaim, BotTaskGithubRef, BotTasksSettings, BotTaskVerification } from "../../shared/bot-tasks.ts";
 import { REPO_PATTERN } from "../../shared/bot-tasks.ts";
-import { GithubError, type GithubClient } from "./github.ts";
+import { redactSecretsInText } from "../../shared/redact.ts";
+import { GithubError, storedGithubUrl, type GithubClient } from "./github.ts";
 import { repoAllowed } from "./settings.ts";
 
 export class BotTaskError extends Error {
   readonly status: number;
-  constructor(status: number, message: string) {
+  readonly code?: string;
+  constructor(status: number, message: string, code?: string) {
     super(message);
     this.status = status;
+    this.code = code;
   }
 }
 
@@ -36,18 +39,18 @@ export function parseEvidence(raw: unknown): BotTaskEvidenceClaim {
     }
     case "ci_run": {
       const url = httpsUrl(item.url, "A CI run");
-      return { kind: "ci_run", url: url.toString() };
+      return { kind: "ci_run", url: storedGithubUrl(url.toString()) };
     }
     case "review_url": {
       const url = httpsUrl(item.url, "A review or comment link");
       if (url.hostname !== "github.com" || !/^\/[^/]+\/[^/]+\/(?:pull|issues)\/\d+/.test(url.pathname)) throw new BotTaskError(400, "A review or comment link points at a GitHub pull request or issue, https://github.com/<owner>/<repo>/pull/<n>#…");
-      return { kind: "review_url", url: url.toString() };
+      return { kind: "review_url", url: storedGithubUrl(url.toString()) };
     }
     case "command": {
       const command = typeof item.command === "string" ? item.command.trim() : "";
       if (!command || command.length > 500) throw new BotTaskError(400, `A command item names the command that ran (up to 500 characters). ${EVIDENCE_EXAMPLE}`);
       if (typeof item.exitCode !== "number" || !Number.isInteger(item.exitCode)) throw new BotTaskError(400, `A command item needs the integer exitCode it returned. ${EVIDENCE_EXAMPLE}`);
-      return { kind: "command", command, exitCode: item.exitCode };
+      return { kind: "command", command: redactSecretsInText(command).slice(0, 500), exitCode: item.exitCode };
     }
     default:
       throw new BotTaskError(400, `Evidence kind must be commit, ci_run, review_url or command. ${EVIDENCE_EXAMPLE}`);
@@ -80,10 +83,11 @@ export async function verifyEvidence(
   settings: Pick<BotTasksSettings, "repos">,
   lookup: GithubClient["lookupEvidence"] | undefined,
   checkedAt: number,
+  loadPullCommits?: () => ReturnType<GithubClient["pullCommitEvidence"]>,
 ): Promise<BotTaskEvidence> {
   const result = (status: BotTaskVerification["status"], detail: string): BotTaskEvidence =>
     ({ ...claim, verification: { status, checkedAt, detail } });
-  if (claim.kind === "command") return result("unverifiable", `Recorded exit code ${claim.exitCode}.`);
+  if (claim.kind === "command") return result("unverifiable", `Self-reported exit code ${claim.exitCode}, not independently checked.`);
 
   const repo = ref?.repo ?? (claim.kind === "commit" ? claim.repo : undefined);
   if (!repo || !REPO_PATTERN.test(repo) || !repoAllowed(settings, repo)) {
@@ -119,8 +123,18 @@ export async function verifyEvidence(
   if (!lookup) return result("unverifiable", `No GitHub credential is usable to check ${what}.`);
   try {
     const answer = await lookup(path);
-    if (claim.kind === "commit" && !answer.sha?.toLowerCase().startsWith(claim.sha)) {
-      return result("unverifiable", `GitHub did not return the requested ${what} in ${repo}.`);
+    if (claim.kind === "commit") {
+      const sha = answer.sha?.toLowerCase();
+      if (!sha?.startsWith(claim.sha)) return result("unverifiable", `GitHub did not return the requested ${what} in ${repo}.`);
+      if (ref) {
+        if (!loadPullCommits) return result("unverifiable", `GitHub could not check ${what} against ${refLabel(ref)}.`);
+        const pull = await loadPullCommits().catch(() => undefined);
+        if (pull === undefined) return result("unverifiable", `GitHub could not check ${what} against ${refLabel(ref)}.`);
+        if (pull?.shas.includes(sha)) return result("verified", `${what} is on pull request ${refLabel(ref)}.`);
+        if (pull) return pull.complete
+          ? result("failed", `${what} is not on pull request ${refLabel(ref)}.`)
+          : result("unverifiable", `GitHub returned a limited commit list for ${refLabel(ref)}.`);
+      }
     }
     if (claim.kind === "ci_run") {
       if (jobRun && String(answer.run_id) !== jobRun) return result("failed", `${what} does not belong to run ${jobRun}.`);

@@ -137,5 +137,12 @@ export interface BotTaskAnswer { task: BotTask; ownerName: string }
 export const loadBotTasks = (filters: BotTaskFilters, signal?: AbortSignal) => api<BotTasksList>(`/api/bot-tasks${botTasksQuery(filters)}`, { signal });
 export const loadBotTask = (id: string, signal?: AbortSignal) => api<BotTaskAnswer>(`/api/bot-tasks/${encodeURIComponent(id)}`, { signal });
 export const syncBotTask = (id: string) => api<{ ok: true; task: BotTask }>(`/api/bot-tasks/${encodeURIComponent(id)}/sync`, { method: "POST" });
-export const postBotTask = (id: string, text: string, merge: boolean) =>
-  api<{ ok: true; url: string; task: BotTask }>(`/api/bot-tasks/${encodeURIComponent(id)}/post`, { method: "POST", body: JSON.stringify(merge ? { text, merge: true } : { text }) });
+type ExpectedRef = Pick<BotTaskGithubRef, "repo" | "number">;
+export const loadBotTaskMergeHead = (id: string, { repo, number }: ExpectedRef) => {
+  const query = new URLSearchParams({ repo, number: String(number) });
+  return api<{ sha: string }>(`/api/bot-tasks/${encodeURIComponent(id)}/merge-head?${query}`);
+};
+export const postBotTask = (id: string, text: string, { repo, number }: ExpectedRef, sha?: string) =>
+  api<{ ok: true; url: string; task: BotTask }>(`/api/bot-tasks/${encodeURIComponent(id)}/post`, {
+    method: "POST", body: JSON.stringify({ text, expectedRef: { repo, number }, ...(sha ? { merge: true, sha } : {}) }),
+  });

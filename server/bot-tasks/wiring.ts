@@ -35,14 +35,15 @@ export function createBotTasksHost(deps: BotTasksHostDeps) {
   const client = createGithubClient({ token, now });
   const port: GithubPort = {
     lookupEvidence: client.lookupEvidence,
+    pullCommitEvidence: client.pullCommitEvidence,
     async sync(task, since) {
       const result = await syncGithubTask({ task, client, now: now(), since });
       const activity = result.activity.filter((entry): entry is Exclude<typeof entry, { type: "github_ref" }> => entry.type !== "github_ref");
       return { ref: result.ref, githubState: { state: result.githubState.state }, activity };
     },
-    pull: async (ref) => { const item = await client.pull(ref.repo, ref.number); return { kind: item.kind, state: item.state, mergeable: item.mergeable }; },
+    pull: async (ref) => { const item = await client.pull(ref.repo, ref.number); return { kind: item.kind, state: item.state, mergeable: item.mergeable, headSha: item.headSha, htmlUrl: item.htmlUrl }; },
     postComment: (ref, text, taskId) => client.postComment({ ...ref, taskId }, text),
-    merge: async (ref) => client.merge(ref),
+    merge: (ref, sha) => client.merge(ref, { sha }),
   };
   const tasks = createBotTasks({ dataDir: deps.dataDir, now, settings, botName: deps.botName, github: () => port });
   tasks.onChange((taskId) => deps.broadcast({ kind: "bot-task", taskId }));
@@ -67,7 +68,7 @@ export function createBotTasksHost(deps: BotTasksHostDeps) {
   return {
     tasks,
     routes: createBotTasksRoutes({ tasks, enabled: () => settings().enabled, person: deps.person }),
-    toolRoutes: (turn: { requireActive(): void; botId(): string; readBody(): Promise<unknown>; personAsked(): boolean }) =>
+    toolRoutes: (turn: { requireActive(): void; botId(): string; readBody(): Promise<unknown> }) =>
       createBotTaskToolRoutes({ ...turn, tasks, settings, botName: deps.botName, bots: deps.bots }),
     start(): void {
       if (timer) return;

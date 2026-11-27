@@ -26,14 +26,14 @@ export function botTasksStatus(cfg: Pick<AppConfig, "botTasks">, token: string |
   return { ...botTasksSettings(cfg), githubTokenSet: Boolean(token) };
 }
 
-export function migrateBotTasksGithubToken(dataDir: string, vault: Pick<VaultStore, "setBotTasksGithubToken">): void {
+export function migrateBotTasksGithubToken(dataDir: string, vault: Pick<VaultStore, "botTasksGithubToken" | "setBotTasksGithubToken">): void {
   const path = join(dataDir, "config.json");
   const config = readConfigFile(path);
   if (config.state !== "ok") return;
   const settings = config.value.botTasks;
   if (!settings || typeof settings !== "object" || Array.isArray(settings) || !Object.hasOwn(settings, "githubToken")) return;
   const token = typeof settings.githubToken === "string" ? settings.githubToken.trim() : "";
-  if (token) vault.setBotTasksGithubToken(token);
+  if (token && !vault.botTasksGithubToken()) vault.setBotTasksGithubToken(token);
   delete settings.githubToken;
   if (settings.credential === "token") settings.credential = "vault";
   writeFileAtomic(path, JSON.stringify(config.value, null, 2), { mode: 0o600 });

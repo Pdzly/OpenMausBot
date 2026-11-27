@@ -9,6 +9,10 @@ import { GithubError } from "./github.ts";
 import { createBotTasks, type GithubPort, type GithubSyncResult } from "./service.ts";
 import { BOT_TASKS_FILE } from "./store.ts";
 
+const PERSON = { kind: "person", name: "Philipp" } as const;
+const LINK = { repo: "Pdzly/OpenMausBot", number: 5 };
+const HEAD = "a".repeat(40);
+const PULL_URL = "https://github.com/Pdzly/OpenMausBot/pull/5";
 const LIN: BotTaskActor = { kind: "bot", id: "lin", name: "Lin" };
 const PIXEL: BotTaskActor = { kind: "bot", id: "pixel", name: "Pixel" };
 const NAMES: Record<string, string> = { lin: "Lin", pixel: "Pixel" };
@@ -126,7 +130,7 @@ describe("the evidence rule", () => {
 
   it("refuses done with only a failed command, accepts one that exited 0", async () => {
     const { tasks, id } = open();
-    await refusedAsync(() => tasks.setStatus(id, { status: "done", evidence: [{ kind: "command", command: "pnpm test", exitCode: 1 }], by: LIN }), 422, /Recorded exit code 1/);
+    await refusedAsync(() => tasks.setStatus(id, { status: "done", evidence: [{ kind: "command", command: "pnpm test", exitCode: 1 }], by: LIN }), 422, /Self-reported exit code 1/);
     const done = await tasks.setStatus(id, { status: "done", evidence: [{ kind: "command", command: "pnpm test", exitCode: 0 }], by: LIN });
     expect(done.status).toBe("done");
     expect(done.activity.at(-1)).toMatchObject({ type: "status", from: "open", to: "done", evidence: [{ kind: "command", exitCode: 0, verification: { status: "unverifiable", checkedAt: clock } }] });
@@ -207,6 +211,55 @@ describe("the evidence rule", () => {
     await expect(tasks.setStatus(task.id, { status: "blocked", by: PIXEL })).resolves.toMatchObject({ status: "blocked" });
   });
 
+  it("rechecks the evidence rule after asynchronous verification", async () => {
+    const { tasks, id } = open();
+    settings.requireEvidenceForDone = false;
+    let denyLookup!: (error: Error) => void;
+    github = port({ lookupEvidence: vi.fn(() => new Promise<never>((_resolve, reject) => { denyLookup = reject; })) });
+    const move = tasks.setStatus(id, { status: "done", evidence: [{ ...COMMIT[0], repo: LINK.repo }], by: LIN });
+    settings.requireEvidenceForDone = true;
+    denyLookup(new Error("offline"));
+    await expect(move).rejects.toMatchObject({ status: 422 });
+    expect(tasks.get(id).status).toBe("open");
+  });
+
+  it("verifies linked PR membership once per move and refuses a commit outside the PR", async () => {
+    settings.githubSync = false;
+    const tasks = make();
+    const id = tasks.create({ title: "x", ownerBotId: "lin", by: LIN, github: "Pdzly/OpenMausBot#5" }).task.id;
+    github = port({ pullCommitEvidence: vi.fn(async () => ({ shas: [], complete: true })) });
+    await refusedAsync(() => tasks.setStatus(id, { status: "done", evidence: COMMIT, by: LIN }), 422, /not on pull request/);
+    github = port({ pullCommitEvidence: vi.fn(async () => ({ shas: ["950e39042"], complete: true })) });
+    const done = await tasks.setStatus(id, { status: "done", evidence: [...COMMIT, ...COMMIT], by: LIN });
+    expect(github.pullCommitEvidence).toHaveBeenCalledExactlyOnceWith(LINK);
+    expect(done.evidence).toMatchObject([
+      { verification: { status: "verified", detail: "commit 950e39042 is on pull request Pdzly/OpenMausBot#5." } },
+      { verification: { status: "verified" } },
+    ]);
+  });
+
+  it("restricts explicit links and links inferred from comments to the owner or creator", () => {
+    const tasks = make();
+    const id = tasks.create({ title: "x", ownerBotId: "lin", by: LIN }).task.id;
+    tasks.comment(id, "ordinary note", PIXEL);
+    refused(() => tasks.comment(id, "See Pdzly/OpenMausBot#5", PIXEL), 403, /Only Lin/);
+    refused(() => tasks.linkGithub(id, "Pdzly/OpenMausBot#5", PIXEL), 403, /Only Lin/);
+    expect(tasks.get(id).github).toBeUndefined();
+    tasks.linkGithub(id, "Pdzly/OpenMausBot#5", LIN);
+    refused(() => tasks.linkGithub(id, "Pdzly/OpenMausBot#6", PIXEL), 403, /Only Lin/);
+    expect(tasks.linkGithub(id, "Pdzly/OpenMausBot#6", PERSON).github?.number).toBe(6);
+  });
+
+  it("redacts self-reported commands before persisting them", async () => {
+    const { tasks, id } = open();
+    const token = "ghp_abcdefghijklmnopqrstuvwxyz0123456789ABCD";
+    const done = await tasks.setStatus(id, { status: "done", evidence: [
+      { kind: "command", command: `test --token ${token}`, exitCode: 0 },
+    ], by: LIN });
+    expect(done.evidence?.[0]?.verification).toMatchObject({ status: "unverifiable", detail: /Self-reported/ });
+    expect(readFileSync(join(dir, BOT_TASKS_FILE), "utf8")).not.toContain(token);
+  });
+
   it("keeps a token out of the log", () => {
     const tasks = make();
     const { task } = tasks.create({ title: "x", ownerBotId: "lin", by: LIN });
@@ -226,8 +279,9 @@ const IMPORTED = (extra: Partial<GithubSyncResult> = {}): GithubSyncResult => ({
 });
 const port = (overrides: Partial<GithubPort> = {}): GithubPort => ({
   lookupEvidence: vi.fn(async () => ({ sha: "950e39042" })),
+  pullCommitEvidence: vi.fn(async () => null),
   sync: vi.fn(async () => IMPORTED()),
-  pull: vi.fn(async () => ({ kind: "pull" as const, state: "open" as const, mergeable: true })),
+  pull: vi.fn(async () => ({ kind: "pull" as const, state: "open" as const, mergeable: true, headSha: HEAD, htmlUrl: PULL_URL })),
   postComment: vi.fn(async () => ({ id: 77, url: "https://github.com/Pdzly/OpenMausBot/issues/5#issuecomment-77" })),
   merge: vi.fn(async () => ({ merged: true, sha: "deadbeef" })),
   ...overrides,
@@ -285,11 +339,25 @@ describe("inbound GitHub sync", () => {
     expect(tasks.get(id)).toMatchObject({ github: { number: 6 }, activity: [{ type: "created" }, { type: "github_ref" }, { type: "github_ref" }] });
   });
 
+  it("redacts imported discussion and strips URL queries before writing the ledger", async () => {
+    const token = "ghp_abcdefghijklmnopqrstuvwxyz0123456789ABCD";
+    github = port({ sync: vi.fn(async () => IMPORTED({ activity: [
+      { key: "comment:7", at: clock, by: { kind: "github", login: "dev" }, type: "github_comment", text: `token ${token}`, url: `${PULL_URL}?secret=fixture#issuecomment-7` },
+      { key: "review:7", at: clock, by: { kind: "github", login: "dev" }, type: "github_review", state: "APPROVED", text: `token ${token}` },
+    ] })) });
+    const { tasks, id } = linked();
+    const result = await tasks.sync(id);
+    expect(result.task.activity.find((entry) => entry.key === "comment:7")).toMatchObject({ url: `${PULL_URL}#issuecomment-7` });
+    const disk = readFileSync(join(dir, BOT_TASKS_FILE), "utf8");
+    expect(disk).not.toContain(token);
+    expect(disk).not.toContain("secret=fixture");
+  });
+
   it("never re-imports a comment the app posted itself", async () => {
     settings = { ...settings, githubSync: false, allowOutboundComments: true };
     github = port({ sync: vi.fn(async () => IMPORTED({ activity: [{ key: "comment:77", at: 3_000_000, by: { kind: "github", login: "me" }, type: "github_comment", text: "Fixed in abc1234" }] })) });
     const { tasks, id } = linked();
-    await tasks.post(id, { text: "Fixed in abc1234", by: LIN });
+    await tasks.post(id, { text: "Fixed in abc1234", expectedRef: LINK, by: PERSON });
     expect((await tasks.sync(id, { force: true })).added).toBe(0);
     expect(tasks.get(id).activity.some((entry) => entry.type === "github_comment")).toBe(false);
   });
@@ -346,7 +414,7 @@ describe("the explicit outbound comment", () => {
   it("is off by default and posts nothing", async () => {
     github = port();
     const { tasks, id } = linked();
-    await refusedAsync(() => tasks.post(id, { text: "done", by: LIN }), 403, /off/);
+    await refusedAsync(() => tasks.post(id, { text: "done", expectedRef: LINK, by: PERSON }), 403, /off/);
     expect(github.postComment).not.toHaveBeenCalled();
   });
 
@@ -354,7 +422,7 @@ describe("the explicit outbound comment", () => {
     settings = { ...settings, allowOutboundComments: true };
     github = port();
     const { tasks, id } = linked();
-    const result = await tasks.post(id, { text: "  Fixed in 950e390  ", by: LIN });
+    const result = await tasks.post(id, { text: "  Fixed in 950e390  ", expectedRef: LINK, by: PERSON });
     expect(result).toMatchObject({ merged: false, url: expect.stringContaining("issuecomment-77") });
     expect(github.postComment).toHaveBeenCalledTimes(1);
     expect(github.postComment).toHaveBeenCalledWith({ repo: "Pdzly/OpenMausBot", number: 5 }, "Fixed in 950e390", id);
@@ -366,26 +434,52 @@ describe("the explicit outbound comment", () => {
     settings = { ...settings, allowOutboundComments: true };
     github = port();
     const { tasks, id } = linked();
-    await refusedAsync(() => tasks.post(id, { text: "merging", merge: true, by: LIN }), 403, /Merging is off/);
+    await refusedAsync(() => tasks.post(id, { text: "merging", mergeHead: HEAD, expectedRef: LINK, by: PERSON }), 403, /Merging is off/);
     settings = { ...settings, allowMerge: true };
-    const result = await tasks.post(id, { text: "merging", merge: true, by: LIN });
+    const result = await tasks.post(id, { text: "merging", mergeHead: HEAD, expectedRef: LINK, by: PERSON });
     expect(result.merged).toBe(true);
+    expect(github.merge).toHaveBeenCalledExactlyOnceWith(LINK, HEAD);
     expect((github.merge as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0]).toBeLessThan((github.postComment as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0]!);
     expect(tasks.get(id).activity.at(-1)).toMatchObject({ type: "posted", merged: true });
+  });
+
+  it("records a successful merge before posting and allows a comment-only retry", async () => {
+    settings = { ...settings, allowOutboundComments: true, allowMerge: true };
+    const { tasks, id } = linked();
+    const postComment = vi.fn<GithubPort["postComment"]>()
+      .mockImplementationOnce(async () => {
+        expect(tasks.get(id).activity.at(-1)).toMatchObject({ type: "github_state", state: "merged", by: PERSON });
+        throw new GithubError("offline");
+      })
+      .mockResolvedValueOnce({ id: 9, url: `${PULL_URL}?tracking=secret#issuecomment-9` });
+    github = port({ postComment });
+    await expect(tasks.post(id, { text: "note", expectedRef: LINK, mergeHead: HEAD, by: PERSON }))
+      .rejects.toMatchObject({ status: 502, code: "merge_completed" });
+    await expect(tasks.post(id, { text: "note", expectedRef: LINK, by: PERSON }))
+      .resolves.toMatchObject({ url: `${PULL_URL}#issuecomment-9`, merged: false });
+    expect(github.merge).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not post if GitHub rejects the pinned head", async () => {
+    settings = { ...settings, allowOutboundComments: true, allowMerge: true };
+    github = port({ merge: vi.fn(async () => { throw new GithubError("head moved", 409); }) });
+    const { tasks, id } = linked();
+    await refusedAsync(() => tasks.post(id, { text: "note", expectedRef: LINK, mergeHead: HEAD, by: PERSON }), 409, /changed/);
+    expect(github.postComment).not.toHaveBeenCalled();
   });
 
   it("posts nothing when the merge is impossible", async () => {
     settings = { ...settings, allowOutboundComments: true, allowMerge: true };
     for (const pull of [{ kind: "issue" as const, state: "open" as const, mergeable: null }, { kind: "pull" as const, state: "merged" as const, mergeable: null }, { kind: "pull" as const, state: "open" as const, mergeable: false }]) {
-      github = port({ pull: vi.fn(async () => pull) });
+      github = port({ pull: vi.fn(async () => ({ ...pull, headSha: HEAD, htmlUrl: PULL_URL })) });
       const { tasks, id } = linked();
-      await refusedAsync(() => tasks.post(id, { text: "merging", merge: true, by: LIN }), 409);
+      await refusedAsync(() => tasks.post(id, { text: "merging", mergeHead: HEAD, expectedRef: LINK, by: PERSON }), 409);
       expect(github.merge).not.toHaveBeenCalled();
       expect(github.postComment).not.toHaveBeenCalled();
     }
     github = port({ merge: vi.fn(async () => ({ merged: false, message: "checks failing" })) });
     const { tasks, id } = linked();
-    await refusedAsync(() => tasks.post(id, { text: "merging", merge: true, by: LIN }), 502, /did not merge/);
+    await refusedAsync(() => tasks.post(id, { text: "merging", mergeHead: HEAD, expectedRef: LINK, by: PERSON }), 502, /did not merge/);
     expect(github.postComment).not.toHaveBeenCalled();
   });
 
@@ -394,11 +488,11 @@ describe("the explicit outbound comment", () => {
     github = port();
     const tasks = make();
     const bare = tasks.create({ title: "x", ownerBotId: "lin", by: LIN }).task.id;
-    await refusedAsync(() => tasks.post(bare, { text: "hi", by: LIN }), 409);
+    await refusedAsync(() => tasks.post(bare, { text: "hi", expectedRef: LINK, by: PERSON }), 409);
     const outside = tasks.create({ title: "x", ownerBotId: "lin", by: LIN, github: "linx-systems/clamui#370" }).task.id;
-    await refusedAsync(() => tasks.post(outside, { text: "hi", by: LIN }), 403, /not on the allowed/);
+    await refusedAsync(() => tasks.post(outside, { text: "hi", expectedRef: { repo: "linx-systems/clamui", number: 370 }, by: PERSON }), 403, /allowlist/);
     const id = tasks.create({ title: "y", ownerBotId: "lin", by: LIN, github: "Pdzly/OpenMausBot#5" }).task.id;
-    await refusedAsync(() => tasks.post(id, { text: "   ", by: LIN }), 400);
+    await refusedAsync(() => tasks.post(id, { text: "   ", expectedRef: LINK, by: PERSON }), 400);
     expect(github.postComment).not.toHaveBeenCalled();
   });
 
@@ -407,8 +501,9 @@ describe("the explicit outbound comment", () => {
     let release!: () => void;
     github = port({ postComment: vi.fn(() => new Promise<{ id: number; url: string }>((resolve) => { release = () => resolve({ id: 1, url: "https://github.com/x/y/issues/1#c" }); })) });
     const { tasks, id } = linked();
-    const first = tasks.post(id, { text: "one", by: LIN });
-    await refusedAsync(() => tasks.post(id, { text: "two", by: LIN }), 409, /already running/);
+    const first = tasks.post(id, { text: "one", expectedRef: LINK, by: PERSON });
+    refused(() => tasks.linkGithub(id, "Pdzly/OpenMausBot#6", PERSON), 409, /in progress/);
+    await refusedAsync(() => tasks.post(id, { text: "two", expectedRef: LINK, by: PERSON }), 409, /already running/);
     release();
     await first;
     expect(github.postComment).toHaveBeenCalledTimes(1);

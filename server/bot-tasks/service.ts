@@ -9,7 +9,7 @@ import {
 } from "../../shared/bot-tasks.ts";
 import { redactSecretsInText } from "../../shared/redact.ts";
 import { BotTaskError, githubRefsIn, parseEvidence, parseRef, refLabel, supportsDone, verifyEvidence } from "./evidence.ts";
-import type { GithubClient } from "./github.ts";
+import { GithubError, storedGithubUrl, type GithubClient } from "./github.ts";
 import { repoAllowed } from "./settings.ts";
 import { BOT_TASKS_FILE, readBotTasksFile, writeBotTasksFile } from "./store.ts";
 
@@ -32,9 +32,10 @@ export interface GithubSyncResult {
 export interface GithubPort {
   sync(task: BotTask, since: number): Promise<GithubSyncResult>;
   lookupEvidence: GithubClient["lookupEvidence"];
-  pull(ref: BotTaskGithubRef): Promise<{ kind: "pull" | "issue"; state: "open" | "closed" | "merged"; mergeable: boolean | null }>;
+  pullCommitEvidence: GithubClient["pullCommitEvidence"];
+  pull(ref: BotTaskGithubRef): Promise<{ kind: "pull" | "issue"; state: "open" | "closed" | "merged"; mergeable: boolean | null; headSha: string | null; htmlUrl: string }>;
   postComment(ref: BotTaskGithubRef, text: string, taskId: string): Promise<{ id: string | number; url: string }>;
-  merge(ref: BotTaskGithubRef): Promise<{ merged: boolean; sha?: string; message?: string }>;
+  merge(ref: BotTaskGithubRef, headSha: string): Promise<{ merged: boolean; sha?: string; message?: string }>;
 }
 
 export interface BotTasksDeps {
@@ -122,6 +123,29 @@ export function createBotTasks(deps: BotTasksDeps) {
   const withRef = (task: BotTask, ref: BotTaskGithubRef, by: BotTaskActor, at: number): { task: BotTask; entry: BotTaskActivity } =>
     ({ task: { ...task, github: ref }, entry: activity(by, { type: "github_ref", ref }, at) });
 
+  const outbound = (id: string, expectedRef: BotTaskGithubRef, merge: boolean) => {
+    const settings = deps.settings();
+    if (!settings.allowOutboundComments) throw new BotTaskError(403, "Posting to GitHub is off in Settings → Bot tasks.");
+    if (merge && !settings.allowMerge) throw new BotTaskError(403, "Merging is off in Settings → Bot tasks.");
+    const ref = found(id).github;
+    if (!ref || refLabel(ref).toLowerCase() !== refLabel(expectedRef).toLowerCase()) {
+      throw new BotTaskError(409, "The task's GitHub link changed. Review the current link and confirm again.");
+    }
+    if (!repoAllowed(settings, ref.repo)) throw new BotTaskError(403, `${ref.repo} is outside the repository allowlist.`);
+    const github = deps.github();
+    if (!github) throw new BotTaskError(503, "No GitHub credential is usable. Check Settings → Bot tasks.");
+    return { ref, github };
+  };
+
+  const mergeHead = async (ref: BotTaskGithubRef, github: GithubPort) => {
+    const pull = await github.pull(ref);
+    if (pull.kind !== "pull") throw new BotTaskError(409, `${refLabel(ref)} is an issue and cannot be merged.`);
+    if (pull.state !== "open") throw new BotTaskError(409, `${refLabel(ref)} is already ${pull.state}.`);
+    if (pull.mergeable === false) throw new BotTaskError(409, `${refLabel(ref)} is not mergeable now.`);
+    if (!pull.headSha) throw new BotTaskError(409, "The pull request head is unavailable. Refresh and confirm again.");
+    return { sha: pull.headSha, url: pull.htmlUrl };
+  };
+
   const latestLink = (task: BotTask) => task.activity.findLast((entry) => entry.type === "github_ref");
   const startBackfill = (task: BotTask) => {
     const settings = deps.settings();
@@ -164,6 +188,7 @@ export function createBotTasks(deps: BotTasksDeps) {
       const at = now();
       const before = found(id);
       const { ref, candidates } = autoRef(before, [body]);
+      if (ref) needOwn(before, by, "link it to GitHub");
       const entries = [activity(by, { type: "comment", text: body }, at)];
       const task = commit(id, (current) => {
         if (!ref) return current;
@@ -189,15 +214,25 @@ export function createBotTasks(deps: BotTasksDeps) {
       if (!moved && !input.comment && !ownerChanged) throw new BotTaskError(409, `The task is already ${input.status}.`);
       const comment = input.comment ? clean(input.comment, BOT_TASK_LIMITS.textMax) : "";
       const link = autoRef(before, [comment, ...claims.flatMap((item) => (item.kind === "review_url" || item.kind === "ci_run" ? [item.url] : []))]);
-      const required = (input.status === "done" && settings.requireEvidenceForDone) || (input.status === "review" && settings.requireEvidenceForReview);
-      const verify = moved && (input.status === "done" || required);
+      const verify = moved && (input.status === "done" || (input.status === "review" && settings.requireEvidenceForReview));
       let evidence: BotTaskEvidence[] = claims;
       if (verify && claims.length) {
-        const lookup = deps.github()?.lookupEvidence;
+        const github = deps.github();
+        const ref = before.github ?? link.ref;
         const checkedAt = now();
-        evidence = await Promise.all(claims.map((claim) => verifyEvidence(claim, before.github ?? link.ref, settings, lookup, checkedAt)));
+        let pullCommits: ReturnType<GithubClient["pullCommitEvidence"]> | undefined;
+        const loadPullCommits = github && ref ? () => (pullCommits ??= github.pullCommitEvidence(ref)) : undefined;
+        evidence = await Promise.all(claims.map((claim) => verifyEvidence(claim, ref, settings, github?.lookupEvidence, checkedAt, loadPullCommits)));
         const failed = evidence.find((item) => item.verification?.status === "failed");
         if (failed) throw new BotTaskError(422, `Blocked: ${failed.verification?.detail}`);
+      }
+      const latestSettings = deps.settings();
+      const required = (input.status === "done" && latestSettings.requireEvidenceForDone) ||
+        (input.status === "review" && latestSettings.requireEvidenceForReview);
+      for (const item of evidence) {
+        if (item.verification?.status !== "verified") continue;
+        const repo = before.github?.repo ?? link.ref?.repo ?? (item.kind === "commit" ? item.repo : undefined);
+        if (repo && !repoAllowed(latestSettings, repo)) throw new BotTaskError(409, "The GitHub allowlist changed during verification. Review Settings and retry.");
       }
       if (moved && required && !supportsDone(evidence)) {
         const issue = evidence.find((item) => item.verification?.status === "unverifiable")?.verification?.detail;
@@ -237,7 +272,9 @@ export function createBotTasks(deps: BotTasksDeps) {
     linkGithub(id: string, rawRef: string, by: BotTaskActor): BotTask {
       const ref = parseRef(rawRef);
       const before = found(id);
+      needOwn(before, by, "change its GitHub link");
       if (before.github && refLabel(before.github).toLowerCase() === refLabel(ref).toLowerCase()) return before;
+      if (posting.has(id)) throw new BotTaskError(409, "A GitHub post is in progress. Try again when it finishes.");
       const at = now();
       const linked = commit(id, (current) => {
         const { githubState: _old, ...rest } = current;
@@ -297,6 +334,8 @@ export function createBotTasks(deps: BotTasksDeps) {
         for (const { key, at, by, ...body } of result.activity) {
           if (at < since || have.has(key)) continue;
           have.add(key);
+          if ("text" in body) body.text = clean(body.text, BOT_TASK_LIMITS.textMax);
+          if (body.url) body.url = storedGithubUrl(body.url) || undefined;
           entries.push({ ...activity(by, body, at, key), ...(at < linkAt ? { imported: true } : {}) });
         }
         const retained = new Set(capLog([...current.activity, ...entries].sort((a, b) => a.at - b.at)));
@@ -335,35 +374,45 @@ export function createBotTasks(deps: BotTasksDeps) {
       return result;
     },
 
-    /** The one outbound path: a comment on the task's pull request or issue, and a merge only when asked. Needs both switches in Settings. */
-    async post(id: string, input: { text: string; merge?: boolean; by: BotTaskActor }): Promise<{ url: string; merged: boolean; task: BotTask }> {
-      const settings = deps.settings();
-      if (!settings.allowOutboundComments) throw new BotTaskError(403, "Posting to GitHub is off. The person turns on 'Allow comments on GitHub' in Settings → Bot tasks; nothing was posted.");
-      if (input.merge && !settings.allowMerge) throw new BotTaskError(403, "Merging is off. The person turns on 'Allow merging' in Settings → Bot tasks; nothing was posted or merged.");
-      const task = found(id);
-      if (!task.github) throw new BotTaskError(409, "This task has no GitHub reference. Link one first.");
-      if (!repoAllowed(settings, task.github.repo)) throw new BotTaskError(403, `${task.github.repo} is not on the allowed repositories of Settings → Bot tasks; nothing was posted.`);
+    async prepareMerge(id: string, expectedRef: BotTaskGithubRef): Promise<{ sha: string }> {
+      const { ref, github } = outbound(id, expectedRef, true);
+      const head = await mergeHead(ref, github);
+      outbound(id, expectedRef, true);
+      return { sha: head.sha };
+    },
+
+    async post(id: string, input: { text: string; expectedRef: BotTaskGithubRef; mergeHead?: string; by: Extract<BotTaskActor, { kind: "person" }> }): Promise<{ url: string; merged: boolean; task: BotTask }> {
+      const { ref, github } = outbound(id, input.expectedRef, Boolean(input.mergeHead));
       const text = clean(input.text, BOT_TASK_LIMITS.textMax);
       if (!text) throw new BotTaskError(400, "The comment needs text.");
-      const github = deps.github();
-      if (!github) throw new BotTaskError(503, "No GitHub credential is usable. Choose the gh CLI or save a token in Settings → Bot tasks.");
       if (posting.has(id)) throw new BotTaskError(409, "A post for this task is already running.");
       posting.add(id);
+      let merged = false;
       try {
-        const ref = task.github;
-        let merged = false;
-        if (input.merge) {
-          const pull = await github.pull(ref);
-          if (pull.kind !== "pull") throw new BotTaskError(409, `${refLabel(ref)} is an issue, not a pull request: it cannot be merged. Nothing was posted.`);
-          if (pull.state !== "open") throw new BotTaskError(409, `${refLabel(ref)} is already ${pull.state}. Nothing was posted.`);
-          if (pull.mergeable === false) throw new BotTaskError(409, `${refLabel(ref)} is not mergeable now (conflicts or failing required checks). Nothing was posted or merged.`);
-          const result = await github.merge(ref);
-          if (!result.merged) throw new BotTaskError(502, `GitHub did not merge ${refLabel(ref)}: ${redactSecretsInText(result.message ?? "no reason given").slice(0, 200)}. Nothing was posted.`);
+        if (input.mergeHead) {
+          const head = await mergeHead(ref, github);
+          if (head.sha !== input.mergeHead) throw new BotTaskError(409, "The pull request head changed. Review it and confirm again.");
+          outbound(id, input.expectedRef, true);
+          const result = await github.merge(ref, input.mergeHead).catch((error: unknown) => {
+            if (error instanceof GithubError && error.status === 409) throw new BotTaskError(409, "The pull request changed. Review it and confirm again.");
+            throw error;
+          });
+          if (!result.merged) throw new BotTaskError(502, `GitHub did not merge ${refLabel(ref)}: ${clean(result.message ?? "no reason given", 200)}.`);
           merged = true;
+          const key = `${refLabel(ref).toLowerCase()}:state:merged`;
+          if (!found(id).activity.some((entry) => entry.key === key)) {
+            commit(id, (current) => ({
+              ...current, githubState: { syncedAt: 0, ...current.githubState, state: "merged" },
+            }), [activity(input.by, { type: "github_state", state: "merged", url: storedGithubUrl(head.url) }, now(), key)]);
+          }
         }
-        const posted = await github.postComment(ref, text, id);
-        const updated = commit(id, (current) => current, [activity(input.by, { type: "posted", url: posted.url, ...(merged ? { merged: true } : {}) }, now(), `comment:${posted.id}`)]);
-        return { url: posted.url, merged, task: updated };
+        const posted = await github.postComment(ref, text, id).catch((error: unknown) => {
+          if (merged) throw new BotTaskError(502, "GitHub merged the pull request, but the comment could not be confirmed. Check GitHub before retrying the comment.", "merge_completed");
+          throw error;
+        });
+        const url = storedGithubUrl(posted.url);
+        const updated = commit(id, (current) => current, [activity(input.by, { type: "posted", url, ...(merged ? { merged: true } : {}) }, now(), `comment:${posted.id}`)]);
+        return { url, merged, task: updated };
       } finally {
         posting.delete(id);
       }

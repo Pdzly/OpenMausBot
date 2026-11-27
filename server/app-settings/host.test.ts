@@ -373,8 +373,10 @@ describe("owner-only tier", () => {
     expect(refused.status).toBeGreaterThanOrEqual(400);
     expect(saved).toEqual([]);
     const tasks = await host.handle({ action: "get", id: "botTasks.tasks" }, turn);
-    expect(String(tasks.body.text)).toContain("requireEvidenceForDone");
-    expect(String(tasks.body.text)).not.toMatch(/credential|githubToken|allowMerge/);
+    expect(String(tasks.body.text)).toContain("pollMinutes");
+    expect(String(tasks.body.text)).not.toMatch(/credential|githubToken|allowMerge|repos|requireEvidence/);
+    expect((await set("botTasks.tasks", { repos: ["org/repo"], requireEvidenceForDone: false, requireEvidenceForReview: false })).status).toBe(400);
+    expect(saved).toEqual([]);
   });
   it("explains and refuses with where to change it: sign-in, logins, pairing, backups, the domain", async () => {
     const { host, set, turn, cards, saved, routeCalls } = fixture();

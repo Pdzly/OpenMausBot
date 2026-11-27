@@ -6,16 +6,16 @@
 //   POST /api/bot-tasks/:id/post    { ok, url, task } the person's own comment on GitHub, with merge: true to merge first
 import { z } from "zod";
 
-import { BOT_TASK_LIMITS, BOT_TASK_STATUSES, type BotTaskActor } from "../../shared/bot-tasks.ts";
+import { BOT_TASK_LIMITS, BOT_TASK_STATUSES, REPO_PATTERN, type BotTaskActor } from "../../shared/bot-tasks.ts";
 import { BotTaskError } from "../bot-tasks/evidence.ts";
 import type { BotTasks } from "../bot-tasks/service.ts";
-import type { RequestAuth } from "../request-auth.ts";
+import { ownerOrAdmin, type RequestAuth } from "../request-auth.ts";
 import { PASS, type RouteHandler } from "./table.ts";
 
 export const BOT_TASKS_PATH = "/api/bot-tasks";
 
 export interface BotTasksRouteDeps {
-  tasks: Pick<BotTasks, "list" | "get" | "setStatus" | "sync" | "post">;
+  tasks: Pick<BotTasks, "list" | "get" | "setStatus" | "sync" | "linkGithub" | "prepareMerge" | "post">;
   enabled(): boolean;
   person(auth: RequestAuth): string;
 }
@@ -26,7 +26,13 @@ const statusSchema = z.object({
   comment: z.string().max(BOT_TASK_LIMITS.textMax).optional(),
 }).strict();
 
-const postSchema = z.object({ text: z.string().max(BOT_TASK_LIMITS.textMax), merge: z.boolean().optional() }).strict();
+const refSchema = z.object({ repo: z.string().regex(REPO_PATTERN), number: z.number().int().positive() }).strict();
+const postSchema = z.object({
+  text: z.string().max(BOT_TASK_LIMITS.textMax),
+  expectedRef: refSchema,
+  merge: z.boolean().optional(),
+  sha: z.string().regex(/^[0-9a-f]{40}$/).optional(),
+}).strict().refine((body) => Boolean(body.merge) === Boolean(body.sha));
 
 export function createBotTasksRoutes(deps: BotTasksRouteDeps): RouteHandler {
   return async ({ req, res, path, method, url, auth, json, readBody }) => {
@@ -58,21 +64,36 @@ export function createBotTasksRoutes(deps: BotTasksRouteDeps): RouteHandler {
         const { ownerName, ...task } = deps.tasks.get(id);
         return json(res, 200, { task, ownerName });
       }
+      if ((action === "post" || action === "merge-head" || action === "link") && !ownerOrAdmin(auth)) {
+        return json(res, 403, { error: "Only an administrator can use this GitHub action." });
+      }
+      if (action === "merge-head") {
+        if (method !== "GET") return json(res, 405, { error: "Use GET." });
+        const ref = refSchema.safeParse({ repo: url.searchParams.get("repo"), number: Number(url.searchParams.get("number")) });
+        if (!ref.success) return json(res, 400, { error: "Send a GitHub repository and pull request number." });
+        return json(res, 200, await deps.tasks.prepareMerge(id, ref.data));
+      }
       if (method !== "POST") return json(res, 405, { error: "Use POST." });
       if (action === "sync") {
         const { task } = await deps.tasks.sync(id, { force: true });
         return json(res, 200, { ok: true, task });
       }
+      if (action === "link") {
+        const parsed = z.object({ ref: z.string().max(300) }).strict().safeParse(await readBody(req, 16_000).catch(() => null));
+        if (!parsed.success) return json(res, 400, { error: "Send a GitHub reference." });
+        const task = deps.tasks.linkGithub(id, parsed.data.ref, { kind: "person", name: deps.person(auth) });
+        return json(res, 200, { ok: true, task });
+      }
       if (action === "post") {
         const parsed = postSchema.safeParse(await readBody(req, 16_000).catch(() => null));
-        if (!parsed.success) return json(res, 400, { error: "Send text (and merge: true to merge first)." });
-        const by: BotTaskActor = { kind: "person", name: deps.person(auth) };
-        const result = await deps.tasks.post(id, { text: parsed.data.text, ...(parsed.data.merge ? { merge: true } : {}), by });
+        if (!parsed.success) return json(res, 400, { error: "Send text and the displayed GitHub link. To merge, include the confirmed head SHA." });
+        const by: Extract<BotTaskActor, { kind: "person" }> = { kind: "person", name: deps.person(auth) };
+        const result = await deps.tasks.post(id, { text: parsed.data.text, expectedRef: parsed.data.expectedRef, mergeHead: parsed.data.sha, by });
         return json(res, 200, { ok: true, url: result.url, task: result.task });
       }
       return json(res, 404, { error: "not found" });
     } catch (error) {
-      if (error instanceof BotTaskError) return json(res, error.status, { error: error.message });
+      if (error instanceof BotTaskError) return json(res, error.status, { error: error.message, ...(error.code ? { code: error.code } : {}) });
       throw error;
     }
   };

@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { BOT_TASK_LIMITS, REPO_PATTERN, type BotTaskGithubRef } from "../../shared/bot-tasks.ts";
+import { redactSecretsInText } from "../../shared/redact.ts";
 
 const API = "https://api.github.com";
 const MARKER_PREFIX = "<!-- omb-bot-task:";
@@ -27,6 +28,15 @@ export async function resolveGithubToken(
   };
   ghTokens.set(exec, entry);
   return entry.pending;
+}
+
+export function storedGithubUrl(raw: string): string {
+  try {
+    const url = new URL(raw);
+    if (url.protocol !== "https:" || url.username || url.password) return "";
+    url.search = "";
+    return redactSecretsInText(url.toString());
+  } catch { return ""; }
 }
 
 export function redactToken(text: string, token?: string | null): string {
@@ -80,6 +90,7 @@ type PullResponse = {
   closed_at?: string | null;
   merged_at?: string | null;
   merged_by?: GithubUser;
+  pull_request?: object;
 };
 type Comment = { id: number; user?: GithubUser; body?: string | null; created_at: string; html_url: string };
 type Review = Omit<Comment, "created_at"> & { submitted_at?: string; state: string };
@@ -199,7 +210,7 @@ export function createGithubClient({
     }
   }
 
-  async function pages<T, Page = T[]>(path: string, extract: (page: Page) => T[], newest = false): Promise<T[]> {
+  async function pages<T, Page = T[]>(path: string, extract: (page: Page) => T[], newest = false, timeout?: number): Promise<T[]> {
     let url: URL | undefined = new URL(path, API);
     url.searchParams.set("per_page", "100");
     const batches: T[][] = [];
@@ -207,7 +218,7 @@ export function createGithubClient({
     const visited = new Set<string>();
     for (let page = 0; url && page < 5 && !visited.has(url.href); page++) {
       visited.add(url.href);
-      const result: { data: Page; headers: Headers } = await request<Page>(url);
+      const result: { data: Page; headers: Headers } = await request<Page>(url, "GET", undefined, undefined, timeout);
       if (backwards) batches.splice(1, 0, extract(result.data));
       else batches.push(extract(result.data));
       const last: URL | undefined = newest && page === 0 ? paginationLink(result.headers, url, "last") : undefined;
@@ -221,16 +232,17 @@ export function createGithubClient({
     return (await request<{ login: string }>("/user")).data.login;
   }
 
-  async function pull(repo: string, number: number): Promise<GithubItem> {
+  async function pull(repo: string, number: number, timeout?: number): Promise<GithubItem> {
     const path = repoPath(repo, number);
     let kind: GithubItem["kind"] = "pull";
     let item: PullResponse;
     try {
-      item = (await request<PullResponse>(`${path}/pulls/${number}`)).data;
+      item = (await request<PullResponse>(`${path}/pulls/${number}`, "GET", undefined, undefined, timeout)).data;
     } catch (error) {
       if (!(error instanceof GithubError && error.status === 404)) throw error;
       kind = "issue";
-      item = (await request<PullResponse>(`${path}/issues/${number}`)).data;
+      item = (await request<PullResponse>(`${path}/issues/${number}`, "GET", undefined, undefined, timeout)).data;
+      if (item.pull_request) throw new GithubError("GitHub pull request access is unavailable", 403);
     }
     return {
       kind,
@@ -267,7 +279,7 @@ export function createGithubClient({
         activity.push({
           type: "comment", key: `${prefix}:${comment.id}`, at, login: comment.user?.login ?? "github",
           ...(prefix === "review-comment" ? { legacyKey: `comment:${comment.id}` } : {}),
-          ownMarker: body.includes(MARKER_PREFIX), text: body.slice(0, BOT_TASK_LIMITS.textMax), url: comment.html_url,
+          ownMarker: body.includes(MARKER_PREFIX), text: redactSecretsInText(body).slice(0, BOT_TASK_LIMITS.textMax), url: comment.html_url,
         });
       }
     }
@@ -276,7 +288,7 @@ export function createGithubClient({
       if (!Number.isFinite(at) || at < sinceMs) continue;
       activity.push({
         type: "review", key: `review:${review.id}`, at, login: review.user?.login ?? "github",
-        state: review.state, text: (review.body ?? "").slice(0, BOT_TASK_LIMITS.textMax), url: review.html_url,
+        state: review.state, text: redactSecretsInText(review.body ?? "").slice(0, BOT_TASK_LIMITS.textMax), url: review.html_url,
       });
     }
     activity.push(...stateEvents(snapshot, issueEvents), ...checkEvents);
@@ -334,14 +346,21 @@ export function createGithubClient({
   }
 
   async function merge(
-    ref: BotTaskGithubRef, { method }: { method?: "merge" | "squash" | "rebase" } = {},
+    ref: BotTaskGithubRef, { sha, method }: { sha: string; method?: "merge" | "squash" | "rebase" },
   ): Promise<{ merged: boolean; sha: string; message: string }> {
     const path = repoPath(ref.repo, ref.number);
     const { data } = await request<{ merged: boolean; sha: string; message: string }>(
-      `${path}/pulls/${ref.number}/merge`, "PUT", { merge_method: method },
+      `${path}/pulls/${ref.number}/merge`, "PUT", { sha, merge_method: method },
       ({ merged, sha, message }, credential) => ({ merged, sha, message: redactToken(message, credential) }),
     );
     return data;
+  }
+
+  async function pullCommitEvidence(ref: BotTaskGithubRef): Promise<{ shas: string[]; complete: boolean } | null> {
+    if ((await pull(ref.repo, ref.number, EVIDENCE_TIMEOUT_MS)).kind === "issue") return null;
+    const path = `${repoPath(ref.repo, ref.number)}/pulls/${ref.number}/commits`;
+    const commits = await pages(path, (page: Array<{ sha: string }>) => page, false, EVIDENCE_TIMEOUT_MS);
+    return { shas: commits.map(({ sha }) => sha), complete: commits.length < 250 };
   }
 
   async function lookupEvidence(path: string): Promise<EvidenceResponse> {
@@ -351,7 +370,7 @@ export function createGithubClient({
     )).data;
   }
 
-  return { viewer, pull, events, postComment, merge, lookupEvidence };
+  return { viewer, pull, events, postComment, merge, lookupEvidence, pullCommitEvidence };
 }
 
 export type GithubClient = ReturnType<typeof createGithubClient>;

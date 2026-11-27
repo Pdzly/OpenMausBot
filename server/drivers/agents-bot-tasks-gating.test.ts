@@ -11,6 +11,7 @@ describe("the bot task tools", () => {
   it("exist for a bot only while the task list is on", () => {
     const off = names({});
     const on = names({ OMB_BOT_TASKS: "1" });
+    expect(on.has("task_post_github")).toBe(false);
     for (const tool of BOT_TASK_TOOL_NAMES) {
       expect(off.has(tool), `${tool} while off`).toBe(false);
       expect(on.has(tool), `${tool} while on`).toBe(true);

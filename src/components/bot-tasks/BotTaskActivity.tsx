@@ -23,7 +23,9 @@ const FROM_GITHUB = new Set<BotTaskActivity["type"]>(["github_comment", "github_
 /** One piece of proof, as words a person reads: the short commit, the CI run or review as a GitHub link, the command
  * and how it exited, and what the app's own check on GitHub found, when it made one (older entries have none). */
 export function EvidenceItem({ evidence, taskRepo }: { evidence: BotTaskEvidence; taskRepo?: string }) {
-  const check = evidence.verification;
+  const check = evidence.kind === "command" && evidence.verification?.status === "unverifiable"
+    ? { ...evidence.verification, detail: `Self-reported exit code ${evidence.exitCode}, not independently checked.` }
+    : evidence.verification;
   return (
     <li data-evidence={evidence.kind} data-verification={check?.status} className="flex min-w-0 flex-col gap-0.5">
       <div className="flex min-w-0 flex-wrap items-center gap-1.5">

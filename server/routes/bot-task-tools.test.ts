@@ -15,7 +15,6 @@ let dir: string;
 let settings: BotTasksSettings;
 let github: GithubPort;
 let bot = "lin";
-let asked = true;
 let sentBody: unknown;
 
 const reply = { sent: undefined as undefined | { status: number; body: Record<string, unknown> } };
@@ -31,7 +30,7 @@ const make = () => {
   const tasks = createBotTasks({ dataDir: dir, settings: () => settings, botName: (id) => NAMES[id], github: () => github, log: () => {} });
   const tools = createBotTaskToolRoutes({
     tasks, settings: () => settings, requireActive: () => {}, botId: () => bot, readBody: async () => sentBody, botName: (id) => NAMES[id],
-    bots: () => Object.entries(NAMES).map(([id, name]) => ({ id, name })), personAsked: () => asked,
+    bots: () => Object.entries(NAMES).map(([id, name]) => ({ id, name })),
   });
   return { tasks, tools };
 };
@@ -48,11 +47,11 @@ beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "omb-bot-task-tools-"));
   settings = { ...BOT_TASKS_DEFAULTS, enabled: true, githubSync: true, repos: ["Pdzly/OpenMausBot"] };
   bot = "lin";
-  asked = true;
   github = {
+    pullCommitEvidence: vi.fn(async () => null),
     lookupEvidence: vi.fn(async () => ({ sha: "abc1234" })),
     sync: vi.fn(async () => ({ ref: { repo: "Pdzly/OpenMausBot", number: 5, kind: "pull" as const }, githubState: { state: "open" as const }, activity: [{ key: "comment:1", at: Date.now(), by: { kind: "github" as const, login: "philipp" }, type: "github_comment" as const, text: "Please rebase" }] })),
-    pull: vi.fn(async () => ({ kind: "pull" as const, state: "open" as const, mergeable: true })),
+    pull: vi.fn(async () => ({ kind: "pull" as const, state: "open" as const, mergeable: true, headSha: "a".repeat(40), htmlUrl: "https://github.com/Pdzly/OpenMausBot/pull/5" })),
     postComment: vi.fn(async () => ({ id: 9, url: "https://github.com/Pdzly/OpenMausBot/pull/5#issuecomment-9" })),
     merge: vi.fn(async () => ({ merged: true })),
   };
@@ -138,42 +137,18 @@ describe("the bot task tools", () => {
     expect((await tool(tools, "get", { id: "tsk_missing" })).status).toBe(404);
   });
 
-  describe("task_post_github", () => {
-    const linked = async (tools: RouteHandler) => /tsk_\w+/.exec(text(await tool(tools, "create", { title: "x", github: "Pdzly/OpenMausBot#5" })))![0];
-
-    it("is refused when Settings keep it off, whoever asks", async () => {
-      const { tools } = make();
-      const id = await linked(tools);
-      expect((await tool(tools, "post", { id, text: "done" })).status).toBe(403);
-      expect(github.postComment).not.toHaveBeenCalled();
-    });
-
-    it("is refused in a turn no person began", async () => {
-      settings = { ...settings, allowOutboundComments: true };
-      asked = false;
-      const { tools } = make();
-      const id = await linked(tools);
-      const refused = await tool(tools, "post", { id, text: "done" });
-      expect(refused.status).toBe(403);
-      expect(text(refused)).toMatch(/person's own request/);
-      expect(github.postComment).not.toHaveBeenCalled();
-    });
-
-    it("posts one comment on a person's request, and merges only on merge", async () => {
-      settings = { ...settings, allowOutboundComments: true, allowMerge: true };
-      const { tools } = make();
-      const id = await linked(tools);
-      expect(text(await tool(tools, "post", { id, text: "Fixed in 950e390" }))).toBe("Commented: https://github.com/Pdzly/OpenMausBot/pull/5#issuecomment-9");
-      expect(github.merge).not.toHaveBeenCalled();
-      expect(text(await tool(tools, "post", { id, text: "Merging now", merge: true }))).toMatch(/^Merged and commented/);
-      expect(github.merge).toHaveBeenCalledTimes(1);
-      expect(github.postComment).toHaveBeenCalledTimes(2);
-    });
+  it("has no bot-side GitHub write even when the owner enables UI posting", async () => {
+    settings = { ...settings, allowOutboundComments: true, allowMerge: true };
+    const { tools } = make();
+    expect((await tool(tools, "post", { id: "tsk_1", text: "merge", merge: true })).status).toBe(404);
+    expect(github.postComment).not.toHaveBeenCalled();
+    expect(github.merge).not.toHaveBeenCalled();
   });
 });
 
 describe("the app's task routes", () => {
-  const admin = { kind: "session", session: { email: "p@example.com" } };
+  const admin = { kind: "session", session: { email: "p@example.com" }, scopes: ["admin"] };
+  const expectedRef = { repo: "Pdzly/OpenMausBot", number: 5 };
   const routes = (enabled = true) => {
     const { tasks } = make();
     return { tasks, route: createBotTasksRoutes({ tasks, enabled: () => enabled, person: () => "Philipp" }) };
@@ -228,13 +203,30 @@ describe("the app's task routes", () => {
     expect(synced.body.task.activity.length).toBeGreaterThan(2);
   });
 
+  it("checks the actor, displayed ref and prepared head for a merge", async () => {
+    settings = { ...settings, githubSync: false, allowOutboundComments: true, allowMerge: true };
+    const { route, tasks } = routes();
+    const id = tasks.create({ title: "x", ownerBotId: "lin", by: { kind: "system" }, github: "Pdzly/OpenMausBot#5" }).task.id;
+    const path = `/api/bot-tasks/${id}`;
+    const sha = "a".repeat(40);
+    const prep = `${path}/merge-head?repo=Pdzly%2FOpenMausBot&number=5`;
+    expect(await call(route, "GET", prep, undefined, { ...admin, scopes: ["client"] })).toMatchObject({ status: 403 });
+    expect(await call(route, "GET", prep, undefined, admin)).toMatchObject({ status: 200, body: { sha } });
+    expect(await call(route, "POST", `${path}/post`, { text: "merge", expectedRef, merge: true }, admin)).toMatchObject({ status: 400 });
+    expect(await call(route, "POST", `${path}/post`, { text: "merge", expectedRef, merge: true, sha: "b".repeat(40) }, admin)).toMatchObject({ status: 409 });
+    expect(await call(route, "POST", `${path}/link`, { ref: "Pdzly/OpenMausBot#6" }, admin)).toMatchObject({ status: 200 });
+    expect(await call(route, "POST", `${path}/post`, { text: "merge", expectedRef, merge: true, sha }, admin)).toMatchObject({ status: 409 });
+    expect(github.merge).not.toHaveBeenCalled();
+    expect(github.postComment).not.toHaveBeenCalled();
+  });
+
   it("posts a person's comment only when Settings allow it, as that person", async () => {
     const { route, tasks } = routes();
     const id = tasks.create({ title: "x", ownerBotId: "lin", by: { kind: "bot", id: "lin", name: "Lin" }, github: "Pdzly/OpenMausBot#5" }).task.id;
-    expect(await call(route, "POST", `/api/bot-tasks/${id}/post`, { text: "hello" }, admin)).toMatchObject({ status: 403 });
+    expect(await call(route, "POST", `/api/bot-tasks/${id}/post`, { text: "hello", expectedRef }, admin)).toMatchObject({ status: 403 });
     settings = { ...settings, allowOutboundComments: true };
     expect(await call(route, "POST", `/api/bot-tasks/${id}/post`, { text: "hello", extra: 1 }, admin)).toMatchObject({ status: 400 });
-    const posted = (await call(route, "POST", `/api/bot-tasks/${id}/post`, { text: "hello" }, admin)) as unknown as { status: number; body: { url: string; task: { activity: Array<{ type: string; by: unknown }> } } };
+    const posted = (await call(route, "POST", `/api/bot-tasks/${id}/post`, { text: "hello", expectedRef }, admin)) as unknown as { status: number; body: { url: string; task: { activity: Array<{ type: string; by: unknown }> } } };
     expect(posted.status).toBe(200);
     expect(posted.body.task.activity.at(-1)).toMatchObject({ type: "posted", by: { kind: "person", name: "Philipp" } });
     expect(github.postComment).toHaveBeenCalledTimes(1);

@@ -1,11 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Loader2, RefreshCw, Send } from "lucide-react";
 
-import type { BotTask } from "../../../shared/bot-tasks";
+import type { BotTask, BotTaskGithubRef } from "../../../shared/bot-tasks";
 import { BOT_TASK_LIMITS } from "../../../shared/bot-tasks";
-import { githubRefLabel, loadBotTask, postBotTask, syncBotTask, type BotTasksStatus } from "@/lib/bot-tasks";
+import { githubRefLabel, loadBotTask, loadBotTaskMergeHead, postBotTask, syncBotTask, type BotTasksStatus } from "@/lib/bot-tasks";
 import { onBotTaskChanged } from "@/lib/bot-task-events";
 import { t } from "@/lib/i18n";
+import { ApiError } from "@/state/api";
 import { ConfirmDialog } from "../ConfirmDialog";
 import { BotTaskActivityList } from "./BotTaskActivity";
 import { GithubRefChip, StatusChip, When } from "./parts";
@@ -36,7 +37,7 @@ export function BotTaskDetail({ id, settings, botName, onChanged }: {
   const [composing, setComposing] = useState(false);
   const [text, setText] = useState("");
   const [merge, setMerge] = useState(false);
-  const [confirming, setConfirming] = useState(false);
+  const [confirmation, setConfirmation] = useState<{ id: string; ref: BotTaskGithubRef; text: string; sha?: string } | null>(null);
   const [posting, setPosting] = useState(false);
   const [postError, setPostError] = useState("");
   const [posted, setPosted] = useState("");
@@ -77,7 +78,7 @@ export function BotTaskDetail({ id, settings, botName, onChanged }: {
   const github = task.github;
   const canSync = Boolean(github) && settings.enabled && settings.githubSync;
   const canPost = Boolean(github) && canSync && settings.allowOutboundComments;
-  const canMerge = canPost && settings.allowMerge && github?.kind !== "issue";
+  const canMerge = canPost && settings.allowMerge && github?.kind !== "issue" && task.githubState?.state !== "merged";
 
   const sync = async () => {
     setSyncing(true);
@@ -92,22 +93,49 @@ export function BotTaskDetail({ id, settings, botName, onChanged }: {
       setSyncing(false);
     }
   };
+  const preparePost = async () => {
+    if (!github) return;
+    const draft = { id: task.id, ref: github, text: text.trim() };
+    setPostError("");
+    if (!canMerge || !merge) {
+      setConfirmation(draft);
+      return;
+    }
+    setPosting(true);
+    try {
+      const { sha } = await loadBotTaskMergeHead(draft.id, draft.ref);
+      if (!/^[0-9a-f]{40}$/.test(sha)) throw new Error("Invalid pull request head.");
+      setConfirmation({ ...draft, sha });
+    } catch (error) {
+      setPostError(error instanceof ApiError && error.status === 409 ? error.message : t("botTasks.post.failed"));
+    } finally {
+      setPosting(false);
+    }
+  };
+
   const post = async () => {
+    if (!confirmation || confirmation.id !== id) return;
     setPosting(true);
     setPostError("");
     try {
-      const answer = await postBotTask(task.id, text.trim(), canMerge && merge);
+      const answer = await postBotTask(confirmation.id, confirmation.text, confirmation.ref, confirmation.sha);
       setTask(answer.task);
       setText("");
       setMerge(false);
       setComposing(false);
       setPosted(answer.url);
       onChanged();
-    } catch {
-      setPostError(t("botTasks.post.failed"));
+    } catch (error) {
+      if (error instanceof ApiError && error.body?.code === "merge_completed") {
+        setMerge(false);
+        setPostError(`${t("botTasks.activity.merged")} ${t("botTasks.post.failed")}`);
+        void load();
+      } else {
+        setPostError(error instanceof ApiError && error.status === 409 ? error.message : t("botTasks.post.failed"));
+      }
     } finally {
       setPosting(false);
-      setConfirming(false);
+      setConfirmation(null);
     }
   };
 
@@ -158,7 +186,7 @@ export function BotTaskDetail({ id, settings, botName, onChanged }: {
             {postError && <span role="alert" className="me-auto text-[12px] leading-4 text-danger">{postError}</span>}
             <button type="button" className="ui-button ui-button-md rounded-full" disabled={posting} onClick={() => { setComposing(false); setPostError(""); }}>{t("common.cancel")}</button>
             <button ref={postButton} type="button" data-bot-task-post-send="" className="ui-button ui-button-md ui-button-primary rounded-full" disabled={posting || !text.trim()}
-              onClick={() => setConfirming(true)}>{t("botTasks.post.send")}</button>
+              onClick={() => void preparePost()}>{t("botTasks.post.send")}</button>
           </div>
         </section>
       )}
@@ -168,11 +196,14 @@ export function BotTaskDetail({ id, settings, botName, onChanged }: {
         <BotTaskActivityList activity={task.activity} taskRepo={github?.repo} ownerName={botName} />
       </section>
 
-      <ConfirmDialog open={confirming} pending={posting} returnFocusRef={postButton}
-        title={t(merge && canMerge ? "botTasks.post.confirmMergeTitle" : "botTasks.post.confirmTitle")}
-        body={t(merge && canMerge ? "botTasks.post.confirmMergeBody" : "botTasks.post.confirmBody", { ref: github ? githubRefLabel(github) : "" })}
-        confirmLabel={t(merge && canMerge ? "botTasks.post.confirmMerge" : "botTasks.post.confirm")}
-        onCancel={() => setConfirming(false)} onConfirm={() => void post()} />
+      <ConfirmDialog open={confirmation?.id === id} pending={posting} returnFocusRef={postButton}
+        title={t(confirmation?.sha ? "botTasks.post.confirmMergeTitle" : "botTasks.post.confirmTitle")}
+        body={<>
+          {t(confirmation?.sha ? "botTasks.post.confirmMergeBody" : "botTasks.post.confirmBody", { ref: confirmation ? githubRefLabel(confirmation.ref) : "" })}
+          {confirmation?.sha && <code dir="ltr" className="ui-code-chip mt-2 block w-fit">{confirmation.sha.slice(0, 12)}</code>}
+        </>}
+        confirmLabel={t(confirmation?.sha ? "botTasks.post.confirmMerge" : "botTasks.post.confirm")}
+        onCancel={() => setConfirmation(null)} onConfirm={() => void post()} />
     </article>
   );
 }

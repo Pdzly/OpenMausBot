@@ -105,6 +105,16 @@ describe("BotTaskActivityList", () => {
     expect(linked!.querySelector("time")!.textContent).not.toContain("2025");
   });
 
+  it("shows a recorded command as self-reported using the neutral verification badge", () => {
+    render([{
+      id: "s", at: 1, by: lin, type: "status", from: "review", to: "done", evidence: [
+        { kind: "command", command: "pnpm test", exitCode: 0, verification: { status: "unverifiable", checkedAt: 1, detail: "Recorded exit code 0." } },
+      ],
+    }]);
+    expect(host.querySelector("[data-verification-badge]")?.textContent).toBe("Not verifiable");
+    expect(host.querySelector("[data-verification-line]")?.textContent).toContain("Self-reported exit code 0, not independently checked.");
+  });
+
   it("badges each checked claim: verified, failed as an error, not verifiable as neutral, with when and why", () => {
     const checkedAt = Date.UTC(2026, 10, 27, 9, 0);
     render([{
