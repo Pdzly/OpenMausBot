@@ -162,3 +162,16 @@ Bots reach the same service through the agents tool server (`/api/internal/bot-t
 - One-way: GitHub changes reach the log; edits in the log never reach GitHub.
 - GitHub rate limits apply. The poll backs off by recording one error and trying at the next interval.
 - The file is rewritten on every change, which is fine for the 2000-task cap but not for a team-wide ledger.
+- Trust boundary on a default self-hosted install: a local request without a session counts as the owner (loopback trust,
+  see docs/self-hosting.md). A bot with a local shell can therefore call the same owner routes a person's browser does,
+  including posting to GitHub and changing the repository allowlist or evidence rules. This is how every admin route of
+  the app behaves, not something bot tasks add. Setting `OMB_LOOPBACK_TRUST=service` makes such requests service-only, so
+  these routes need a signed-in admin session.
+- Command evidence with exit code 0 is self-reported and is not checked independently.
+- A sync that was already running when a merge was recorded can briefly write back an older "open" state; the next sync
+  corrects it.
+- Clearing the vault token and later restoring an old config backup that still holds a legacy plaintext token can
+  repopulate the empty vault slot at boot. Old config backups may contain the plaintext token.
+- Late CI results (a check that finishes after a newer push) are only seen for the current head, and the poller does not
+  yet honour GitHub's rate-limit reset time.
+- Verification details and GitHub state labels are English only.
