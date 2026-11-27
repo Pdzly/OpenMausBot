@@ -127,9 +127,21 @@ They are the `botTasks` section of `config.json`:
 
 ## The task view
 
-Bot tasks in the sidebar opens the list: filter by status, bot and repository, search the titles. A task opens with its
-state, owner, GitHub link and the log, with evidence next to the status change it backs. The log updates when a bot or a
-sync adds to it.
+Bot tasks in the sidebar opens a board by default, with a Board / List switch (the choice is kept in this browser).
+Search, status, bot and repository filters apply to both.
+
+The board has one column per status (open, in progress, blocked, in review, done, cancelled) with a count; cancelled
+starts folded. A card shows the title, the GitHub link, how much evidence the task carries and how it checked out, the
+owner and the last activity. Drag a card to another column, or use the menu on the card ("Move to"), which works from
+the keyboard. The board updates when a bot or a sync changes a task.
+
+A move to done (and to review, when "Proof for review" is on) follows the evidence rule: the board asks for a commit,
+CI run, review link or a command with exit code 0 first, and sends the proof with the move. Nothing is sent before
+that. The server decides: GitHub proof that cannot be checked, or a command that exited non-zero, is refused and the
+message stays in the dialog. With the rule off, the card just moves.
+
+A task opens with its state, owner, GitHub link and the log, with evidence next to the status change it backs. The log
+updates when a bot or a sync adds to it.
 
 ## System prompt
 

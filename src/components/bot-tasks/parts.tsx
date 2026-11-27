@@ -27,12 +27,13 @@ export function StatusChip({ status }: { status: BotTaskStatus }) {
 }
 
 /** `owner/repo#12` linking to the pull request or issue on github.com; plain text when the ref can't be a GitHub address. */
-export function GithubRefChip({ githubRef }: { githubRef: BotTaskGithubRef }) {
+/** `compact` drops the owner (clamui#372 for linx-systems/clamui#372) where a narrow card would cut the number off. */
+export function GithubRefChip({ githubRef, compact }: { githubRef: BotTaskGithubRef; compact?: boolean }) {
   const href = githubRefHref(githubRef);
   const Icon = githubRef.kind === "pull" ? GitPullRequest : CircleDot;
   const body = <>
     <Icon size={14} aria-hidden="true" className="shrink-0 text-ink-tertiary" />
-    <span className="truncate" dir="ltr">{githubRefLabel(githubRef)}</span>
+    <span className="truncate" dir="ltr" title={compact ? githubRefLabel(githubRef) : undefined}>{compact ? `${githubRef.repo.split("/").pop()}#${githubRef.number}` : githubRefLabel(githubRef)}</span>
   </>;
   if (!href) return <span data-bot-task-ref="" className="ui-chip min-w-0 border border-hairline/40 text-ink-secondary">{body}</span>;
   return (

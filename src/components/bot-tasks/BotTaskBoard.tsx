@@ -44,7 +44,7 @@ function BoardCard({ task, avatar, settings, dragging, onOpen, onMove, onDragSta
           triggerLabel={t("botTasks.board.moveCard", { title: task.title })} items={items}
           renderTrigger={() => <span className="inline-flex size-7 items-center justify-center rounded-full text-ink-tertiary hover:bg-ink/[0.06] hover:text-ink"><MoreHorizontal size={16} aria-hidden="true" /></span>} />
       </div>
-      {task.github && <div className="flex min-w-0"><GithubRefChip githubRef={task.github} /></div>}
+      {task.github && <div className="flex min-w-0"><GithubRefChip githubRef={task.github} compact /></div>}
       {Boolean(task.evidenceCount) && (
         <div className="flex min-w-0 flex-wrap items-center gap-1.5" data-bot-task-proof-summary="">
           <span className="text-[12px] leading-4 text-ink-secondary">{t("botTasks.board.proofCount", { count: task.evidenceCount ?? 0 })}</span>
@@ -103,7 +103,7 @@ export function BotTaskBoard({ tasks, settings, bots, onOpen, onChanged }: {
     <div className="flex flex-col gap-2">
       {error && <p role="alert" data-bot-board-error="" dir="auto" className="rounded-lg bg-danger/10 px-3 py-2 text-[12px] leading-4 text-danger">{error}</p>}
       <p role="status" className="sr-only">{moved}</p>
-      <div data-bot-board={tasks.length} role="group" aria-label={t("botTasks.board.label")} className="flex items-start gap-3 overflow-x-auto pb-2">
+      <div data-bot-board={tasks.length} role="group" aria-label={t("botTasks.board.label")} className="flex items-start gap-2 overflow-x-auto pb-2">
         {BOT_TASK_STATUSES.map((status) => {
           const cards = groups[status];
           const shut = collapsed.has(status);
@@ -114,7 +114,7 @@ export function BotTaskBoard({ tasks, settings, bots, onOpen, onChanged }: {
               onDragLeave={(event) => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setOver((current) => (current === status ? null : current)); }}
               onDrop={(event) => { event.preventDefault(); setOver(null); if (dragged && canDrop(status)) void request(dragged, status); setDragId(null); }}
               className={cn("flex min-w-0 flex-col gap-2 rounded-xl bg-ink/[0.04] p-2 transition-colors motion-reduce:transition-none",
-                shut ? "w-44 shrink-0" : "min-w-[13.5rem] flex-1 basis-0", over === status && canDrop(status) && "bg-ink/[0.09] outline outline-2 -outline-offset-2 outline-focus")}>
+                shut ? "w-32 shrink-0" : "min-w-[11rem] flex-1 basis-0", over === status && canDrop(status) && "bg-ink/[0.09] outline outline-2 -outline-offset-2 outline-focus")}>
               <h3 className="m-0">
                 <button type="button" aria-expanded={!shut} onClick={() => toggle(status)} data-bot-column-toggle={status}
                   title={t(shut ? "botTasks.board.expand" : "botTasks.board.collapse", { status: t(STATUS_LABEL[status]) })}

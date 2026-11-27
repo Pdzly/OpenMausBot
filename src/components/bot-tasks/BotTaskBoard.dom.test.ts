@@ -70,7 +70,7 @@ describe("the board", () => {
     render();
     expect(cardOf("t1").textContent).toContain("Fix login");
     expect(cardOf("t1").textContent).toContain("Lin");
-    expect(cardOf("t1").querySelector("[data-bot-task-ref]")?.textContent).toBe("linx-systems/clamui#12");
+    expect(cardOf("t1").querySelector("[data-bot-task-ref]")?.textContent).toBe("clamui#12");
     expect(cardOf("t1").querySelector("[data-bot-task-proof-summary]"), "no proof, no proof line").toBeNull();
     expect(cardOf("t2").querySelector("[data-bot-task-proof-summary]")?.textContent).toContain("Proof: 2");
     expect(cardOf("t2").querySelector("[data-verification-badge]")?.getAttribute("data-verification-badge")).toBe("verified");
