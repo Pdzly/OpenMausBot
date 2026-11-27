@@ -3,23 +3,29 @@ import { Loader2, Search } from "lucide-react";
 
 import { BOT_TASK_STATUSES, type BotTaskSummary } from "../../../shared/bot-tasks";
 import {
-  botTasksStatus, filterBotTasks, isBotTaskStatus, loadBotTasks, NO_FILTERS, repoChoices, STATUS_LABEL, type BotTaskFilters, type BotTasksStatus,
+  botTasksStatus, filterBotTasks, isBotTaskStatus, loadBotTasks, NO_FILTERS, readBotTasksLayout, repoChoices, saveBotTasksLayout, STATUS_LABEL,
+  type BotTaskFilters, type BotTasksLayout, type BotTasksStatus,
 } from "@/lib/bot-tasks";
+import { cn } from "@/lib/cn";
 import { onBotTaskChanged } from "@/lib/bot-task-events";
 import { t } from "@/lib/i18n";
 import { useStoreDispatch, useStoreSelector } from "@/state/store-select";
 import { Select } from "../Select";
+import { Segmented } from "../SettingsPrimitives";
 import { TOOL_PAGE_TITLE, ToolPage, ToolPageHeader } from "../ToolPageShell";
+import { BotTaskBoard, type BoardBot } from "./BotTaskBoard";
 import { BotTaskDetail } from "./BotTaskDetail";
 import { GithubRefChip, StatusChip, When } from "./parts";
 
 const SEARCH_WAIT_MS = 250;
 
-export function BotTaskFilterBar({ filters, onChange, bots, repos }: {
+export function BotTaskFilterBar({ filters, onChange, bots, repos, layout, onLayout }: {
   filters: BotTaskFilters;
   onChange: (next: BotTaskFilters) => void;
   bots: ReadonlyArray<{ id: string; name: string }>;
   repos: readonly string[];
+  layout?: BotTasksLayout;
+  onLayout?: (next: BotTasksLayout) => void;
 }) {
   return (
     <div role="search" data-bot-task-filters="" className="flex flex-wrap items-center gap-2">
@@ -42,6 +48,12 @@ export function BotTaskFilterBar({ filters, onChange, bots, repos }: {
         <option value="">{t("botTasks.filter.anyRepo")}</option>
         {repos.map((repo) => <option key={repo} value={repo}>{repo}</option>)}
       </Select>
+      {layout && onLayout && (
+        <div className="ms-auto">
+          <Segmented<BotTasksLayout> label={t("botTasks.view.label")} value={layout} onChange={onLayout}
+            options={[{ value: "board", label: t("botTasks.view.board") }, { value: "list", label: t("botTasks.view.list") }]} />
+        </div>
+      )}
     </div>
   );
 }
@@ -70,7 +82,7 @@ function Centered({ children, alert = false }: { children: ReactNode; alert?: bo
 /** The person's view of the tasks their bots keep: a filtered list, and one task's whole story. */
 export function BotTasksView({ settings, bots, onOpenSettings, openId, onOpen }: {
   settings: BotTasksStatus;
-  bots: ReadonlyArray<{ id: string; name: string }>;
+  bots: ReadonlyArray<BoardBot>;
   onOpenSettings: () => void;
   openId: string | null;
   onOpen: (id: string) => void;
@@ -81,6 +93,7 @@ export function BotTasksView({ settings, bots, onOpenSettings, openId, onOpen }:
   const [enabled, setEnabled] = useState(true);
   const [failed, setFailed] = useState(false);
   const [slow, setSlow] = useState(false);
+  const [layout, setLayout] = useState<BotTasksLayout>(readBotTasksLayout);
   const loading = useRef<AbortController | null>(null);
 
   useEffect(() => {
@@ -121,20 +134,24 @@ export function BotTasksView({ settings, bots, onOpenSettings, openId, onOpen }:
   const botName = useCallback((id: string) => ownerChoices.find((bot) => bot.id === id)?.name ?? id, [ownerChoices]);
   const filtered = filters.status !== "" || filters.bot !== "" || filters.repo !== "" || filters.q.trim() !== "";
 
+  const chooseLayout = (next: BotTasksLayout) => { setLayout(next); saveBotTasksLayout(next); };
+  const wide = !openId && layout === "board";
+  const frame = (content: ReactNode) => <div className={cn("mx-auto w-full", wide ? "max-w-[110rem]" : "max-w-4xl")}>{content}</div>;
+
   if (openId) {
-    return <BotTaskDetail key={openId} id={openId} settings={settings} botName={botName} onChanged={() => void load(query)} />;
+    return frame(<BotTaskDetail key={openId} id={openId} settings={settings} botName={botName} onChanged={() => void load(query)} />);
   }
   if (!enabled || !settings.enabled) {
-    return (
+    return frame(
       <Centered>
         <p className="text-[13px] text-ink-secondary">{t("botTasks.off")}</p>
         <button type="button" className="ui-button ui-button-md rounded-full" onClick={onOpenSettings}>{t("botTasks.openSettings")}</button>
-      </Centered>
+      </Centered>,
     );
   }
-  return (
+  return frame(
     <div className="flex flex-col gap-4">
-      <BotTaskFilterBar filters={filters} onChange={setFilters} bots={ownerChoices} repos={repos} />
+      <BotTaskFilterBar filters={filters} onChange={setFilters} bots={ownerChoices} repos={repos} layout={layout} onLayout={chooseLayout} />
       {failed && !tasks ? (
         <Centered alert>
           <p className="text-[13px] text-ink-secondary">{t("botTasks.loadFailed")}</p>
@@ -152,12 +169,16 @@ export function BotTasksView({ settings, bots, onOpenSettings, openId, onOpen }:
       ) : (
         <>
           {failed && <p role="alert" className="text-[12px] leading-4 text-danger">{t("botTasks.refreshFailed")}</p>}
-          <ul aria-label={t("botTasks.title")} data-bot-tasks={shown.length} className="-mx-3 flex flex-col">
-            {shown.map((task) => <BotTaskRow key={task.id} task={task} onOpen={() => onOpen(task.id)} />)}
-          </ul>
+          {layout === "board" ? (
+            <BotTaskBoard tasks={shown} settings={settings} bots={bots} onOpen={onOpen} onChanged={() => void load(query)} />
+          ) : (
+            <ul aria-label={t("botTasks.title")} data-bot-tasks={shown.length} className="-mx-3 flex flex-col">
+              {shown.map((task) => <BotTaskRow key={task.id} task={task} onOpen={() => onOpen(task.id)} />)}
+            </ul>
+          )}
         </>
       )}
-    </div>
+    </div>,
   );
 }
 
@@ -166,7 +187,7 @@ export function BotTasksPage() {
   const allBots = useStoreSelector((state) => state.bots);
   const dispatch = useStoreDispatch();
   const settings = useMemo(() => botTasksStatus(config), [config]);
-  const bots = useMemo(() => allBots.filter((bot) => !bot.hidden).map((bot) => ({ id: bot.id, name: bot.name })), [allBots]);
+  const bots = useMemo(() => allBots.filter((bot) => !bot.hidden).map((bot) => ({ id: bot.id, name: bot.name, avatar: bot })), [allBots]);
   const [openId, setOpenId] = useState<string | null>(null);
   const back = useRef<HTMLButtonElement>(null);
   return (
@@ -176,7 +197,7 @@ export function BotTasksPage() {
         <h1 className={TOOL_PAGE_TITLE}>{t("botTasks.title")}</h1>
       </ToolPageHeader>
       <div className="min-h-0 flex-1 overflow-y-auto" data-bot-tasks-page={openId ? "detail" : "list"}>
-        <div className="mx-auto w-full max-w-4xl p-4 sm:p-6">
+        <div className="p-4 sm:p-6">
           <BotTasksView settings={settings} bots={bots} openId={openId} onOpen={setOpenId}
             onOpenSettings={() => dispatch({ type: "toggleAppSettings", open: true, section: "bot-tasks" })} />
         </div>

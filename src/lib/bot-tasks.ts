@@ -1,6 +1,6 @@
 import {
   BOT_TASK_STATUSES, BOT_TASKS_DEFAULTS, BOT_TASKS_POLL_MINUTES, REPO_PATTERN,
-  type BotTask, type BotTaskEvidence, type BotTaskGithubRef, type BotTasksSettings, type BotTaskStatus, type BotTaskSummary,
+  type BotTask, type BotTaskEvidence, type BotTaskEvidenceClaim, type BotTaskGithubRef, type BotTasksSettings, type BotTaskStatus, type BotTaskSummary,
 } from "../../shared/bot-tasks";
 import type { LocaleKey } from "@/locales";
 import { api } from "@/state/api";
@@ -146,3 +146,43 @@ export const postBotTask = (id: string, text: string, { repo, number }: Expected
   api<{ ok: true; url: string; task: BotTask }>(`/api/bot-tasks/${encodeURIComponent(id)}/post`, {
     method: "POST", body: JSON.stringify({ text, expectedRef: { repo, number }, ...(sha ? { merge: true, sha } : {}) }),
   });
+
+/** What the board stores about how it looks; the choice is the person's, on this device. */
+export type BotTasksLayout = "board" | "list";
+const VIEW_KEY = "omb.botTasks.view";
+export function readBotTasksLayout(): BotTasksLayout {
+  try { return localStorage.getItem(VIEW_KEY) === "list" ? "list" : "board"; } catch { return "board"; }
+}
+export function saveBotTasksLayout(view: BotTasksLayout): void {
+  try { localStorage.setItem(VIEW_KEY, view); } catch { /* a private window keeps it for this session only */ }
+}
+
+/** The tasks of each status, in the order given. Every status has a column, even an empty one. */
+export function groupByStatus(tasks: readonly BotTaskSummary[]): Record<BotTaskStatus, BotTaskSummary[]> {
+  const groups = Object.fromEntries(BOT_TASK_STATUSES.map((status) => [status, [] as BotTaskSummary[]])) as Record<BotTaskStatus, BotTaskSummary[]>;
+  for (const task of tasks) groups[task.status].push(task);
+  return groups;
+}
+
+/** Moving into this status needs proof under the current settings (the same rule the server applies; the server decides). */
+export function proofRequired(status: BotTaskStatus, settings: Pick<BotTasksSettings, "requireEvidenceForDone" | "requireEvidenceForReview">): boolean {
+  return (status === "done" && settings.requireEvidenceForDone) || (status === "review" && settings.requireEvidenceForReview);
+}
+
+export type ProofKind = BotTaskEvidenceClaim["kind"];
+export const PROOF_KINDS: readonly ProofKind[] = ["commit", "ci_run", "review_url", "command"];
+
+/** The claim a proof form describes, or null while a field is empty or not a number. Nothing here says it is true: GitHub does. */
+export function proofClaim(kind: ProofKind, value: string, exitCode: string): BotTaskEvidenceClaim | null {
+  const text = value.trim();
+  if (!text) return null;
+  switch (kind) {
+    case "commit": return { kind, sha: text };
+    case "ci_run":
+    case "review_url": return { kind, url: text };
+    case "command": return /^-?\d+$/.test(exitCode.trim()) ? { kind, command: text, exitCode: Number(exitCode.trim()) } : null;
+  }
+}
+
+export const moveBotTask = (id: string, status: BotTaskStatus, evidence?: BotTaskEvidenceClaim[]) =>
+  api<{ ok: true; task: BotTask }>(`/api/bot-tasks/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify({ status, ...(evidence?.length ? { evidence } : {}) }) });

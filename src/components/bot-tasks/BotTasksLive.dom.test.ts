@@ -26,6 +26,7 @@ const json = (body: unknown) => Promise.resolve(new Response(JSON.stringify(body
 
 beforeEach(() => {
   setLocale("en");
+  localStorage.setItem("omb.botTasks.view", "list");
   fetched.length = 0;
   listed = [summary("t1", "Fix login")];
   title = "Fix login";

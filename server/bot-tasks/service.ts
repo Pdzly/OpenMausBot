@@ -8,7 +8,7 @@ import {
   type BotTasksSettings, type BotTaskSummary,
 } from "../../shared/bot-tasks.ts";
 import { redactSecretsInText } from "../../shared/redact.ts";
-import { BotTaskError, githubRefsIn, parseEvidence, parseRef, refLabel, supportsDone, verifyEvidence } from "./evidence.ts";
+import { BotTaskError, evidenceStatus, githubRefsIn, parseEvidence, parseRef, refLabel, supportsDone, verifyEvidence } from "./evidence.ts";
 import { GithubError, storedGithubUrl, type GithubClient } from "./github.ts";
 import { repoAllowed } from "./settings.ts";
 import { BOT_TASKS_FILE, readBotTasksFile, writeBotTasksFile } from "./store.ts";
@@ -107,8 +107,12 @@ export function createBotTasks(deps: BotTasksDeps) {
     return updated;
   };
   const summary = (task: BotTask): BotTaskSummary => {
-    const { activity: entries, evidence: _evidence, ...rest } = task;
-    return { ...rest, ownerName: deps.botName(task.ownerBotId) ?? task.ownerBotId, activityCount: entries.length };
+    const { activity: entries, evidence, ...rest } = task;
+    const status = evidenceStatus(evidence);
+    return {
+      ...rest, ownerName: deps.botName(task.ownerBotId) ?? task.ownerBotId, activityCount: entries.length,
+      ...(evidence?.length ? { evidenceCount: evidence.length } : {}), ...(status ? { evidenceStatus: status } : {}),
+    };
   };
   const mayChange = (task: BotTask, by: BotTaskActor) => by.kind !== "bot" || by.id === task.ownerBotId || (task.createdBy.kind === "bot" && task.createdBy.id === by.id);
   const needOwn = (task: BotTask, by: BotTaskActor, what: string) => {

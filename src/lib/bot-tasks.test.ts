@@ -3,7 +3,7 @@
 import { describe, expect, it } from "vitest";
 import type { BotTaskSummary } from "../../shared/bot-tasks";
 import {
-  botTasksPatchBody, botTasksQuery, botTasksStatus, evidenceView, filterBotTasks, githubHref, githubRefHref, NO_FILTERS, parseRepos, pollMinutesValue, repoChoices,
+  botTasksPatchBody, botTasksQuery, botTasksStatus, evidenceView, filterBotTasks, githubHref, githubRefHref, groupByStatus, NO_FILTERS, parseRepos, pollMinutesValue, proofClaim, proofRequired, repoChoices,
 } from "./bot-tasks";
 
 const task = (over: Partial<BotTaskSummary>): BotTaskSummary => ({
@@ -105,5 +105,32 @@ describe("evidenceView", () => {
   it("tells a passing command from a failing one", () => {
     expect(evidenceView({ kind: "command", command: "pnpm test", exitCode: 0 })).toEqual({ kind: "command", command: "pnpm test", exitCode: 0, ok: true });
     expect(evidenceView({ kind: "command", command: "pnpm lint", exitCode: 2 })).toMatchObject({ ok: false });
+  });
+});
+
+describe("the board's helpers", () => {
+  it("gives every status a column, with the tasks in the order they came", () => {
+    const groups = groupByStatus(tasks);
+    expect(Object.keys(groups)).toEqual(["open", "in_progress", "blocked", "review", "done", "cancelled"]);
+    expect(ids(groups.in_progress)).toEqual(["t1"]);
+    expect(groups.review).toEqual([]);
+  });
+  it("asks for proof only where the settings do", () => {
+    const rule = { requireEvidenceForDone: true, requireEvidenceForReview: false };
+    expect(proofRequired("done", rule)).toBe(true);
+    expect(proofRequired("review", rule)).toBe(false);
+    expect(proofRequired("review", { ...rule, requireEvidenceForReview: true })).toBe(true);
+    expect(proofRequired("done", { ...rule, requireEvidenceForDone: false })).toBe(false);
+    expect(proofRequired("blocked", { requireEvidenceForDone: true, requireEvidenceForReview: true })).toBe(false);
+  });
+  it("builds a claim only from a filled form", () => {
+    expect(proofClaim("commit", " abcdef1 ", "0")).toEqual({ kind: "commit", sha: "abcdef1" });
+    expect(proofClaim("ci_run", "https://github.com/o/r/actions/runs/1", "0")).toEqual({ kind: "ci_run", url: "https://github.com/o/r/actions/runs/1" });
+    expect(proofClaim("review_url", "https://github.com/o/r/pull/1#pullrequestreview-2", "")).toMatchObject({ kind: "review_url" });
+    expect(proofClaim("command", "pnpm test", "0")).toEqual({ kind: "command", command: "pnpm test", exitCode: 0 });
+    expect(proofClaim("command", "pnpm test", "1")).toMatchObject({ exitCode: 1 });
+    expect(proofClaim("command", "pnpm test", "")).toBeNull();
+    expect(proofClaim("command", "pnpm test", "zero")).toBeNull();
+    expect(proofClaim("commit", "   ", "0")).toBeNull();
   });
 });

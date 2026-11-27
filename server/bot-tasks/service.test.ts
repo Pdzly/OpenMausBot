@@ -154,6 +154,18 @@ describe("the evidence rule", () => {
     } }]);
   });
 
+  it("lists how much evidence a task carries and how it checked out, without sending the items", async () => {
+    const { tasks, id } = open();
+    expect(tasks.list()[0]).not.toHaveProperty("evidenceCount");
+    await tasks.setStatus(id, { status: "done", evidence: [{ kind: "command", command: "pnpm test", exitCode: 0 }], by: LIN });
+    expect(tasks.list()[0]).toMatchObject({ evidenceCount: 1, evidenceStatus: "unverifiable" });
+    expect(tasks.list()[0]).not.toHaveProperty("evidence");
+    github = port();
+    const second = tasks.create({ title: "y", ownerBotId: "lin", by: LIN }).task.id;
+    await tasks.setStatus(second, { status: "done", evidence: [{ ...COMMIT[0], repo: "Pdzly/OpenMausBot" }, { kind: "command", command: "t", exitCode: 0 }], by: LIN });
+    expect(tasks.list().find((entry) => entry.id === second)).toMatchObject({ evidenceCount: 2, evidenceStatus: "verified" });
+  });
+
   it("does not count unverifiable GitHub evidence as proof", async () => {
     const { tasks, id } = open();
     const evidence = [{ ...COMMIT[0], repo: "Pdzly/OpenMausBot" }];

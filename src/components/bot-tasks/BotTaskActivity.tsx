@@ -48,11 +48,13 @@ const VERIFICATION: Record<BotTaskVerification["status"], { label: LocaleKey; to
 };
 
 /** What the app found when it looked the claim up on GitHub. Failed reads as an error; not verifiable stays neutral. */
-export function VerificationBadge({ verification }: { verification: BotTaskVerification }) {
+export function VerificationBadge({ verification, bare = false }: { verification: BotTaskVerification; bare?: boolean }) {
   const { label, tone, Icon } = VERIFICATION[verification.status];
   const checked = t("botTasks.verification.checked", { time: fullTime(verification.checkedAt) });
+  // `bare`: only the outcome is known (a board card), so no check time is claimed.
+  const title = bare ? undefined : verification.detail ? `${verification.detail}\n${checked}` : checked;
   return (
-    <span data-verification-badge={verification.status} title={verification.detail ? `${verification.detail}\n${checked}` : checked} className={cn("ui-chip shrink-0", tone)}>
+    <span data-verification-badge={verification.status} title={title} className={cn("ui-chip shrink-0", tone)}>
       <Icon size={12} aria-hidden="true" className="shrink-0" />
       {t(label)}
     </span>

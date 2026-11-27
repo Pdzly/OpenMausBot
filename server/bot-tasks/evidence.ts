@@ -57,6 +57,12 @@ export function parseEvidence(raw: unknown): BotTaskEvidenceClaim {
   }
 }
 
+/** The one word the board shows for a task's evidence: the best check any item passed, else the worst it got. */
+export function evidenceStatus(items: readonly BotTaskEvidence[] | undefined): BotTaskVerification["status"] | undefined {
+  const states = (items ?? []).flatMap((item) => (item.verification ? [item.verification.status] : []));
+  return (["verified", "failed", "unverifiable"] as const).find((status) => states.includes(status));
+}
+
 /** A command that failed does not show the work is done. */
 export function supportsDone(items: readonly BotTaskEvidence[]): boolean {
   return items.some((item) => item.kind === "command" ? item.exitCode === 0 : item.verification?.status === "verified");

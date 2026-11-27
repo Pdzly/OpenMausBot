@@ -84,6 +84,11 @@ export interface BotTask {
 export interface BotTaskSummary extends Omit<BotTask, "activity" | "evidence"> {
   ownerName: string;
   activityCount: number;
+  /** How many evidence items the current status carries; 0 when it has none. */
+  evidenceCount?: number;
+  /** What GitHub said about that evidence: `verified` when any item checked out, else `failed`, else `unverifiable`
+   * (a recorded command is only the bot's own word, so it is never better than that). Absent when there is no evidence. */
+  evidenceStatus?: BotTaskVerification["status"];
 }
 
 /** `botTasks` in config.json, and what Settings shows. `credential: "vault"` reads a token kept in the Vault (never in config.json);
