@@ -84,15 +84,29 @@ describe("BotTasksSettingsView", () => {
     expect(sent()).toEqual([{ botTasks: { pollMinutes: 15 } }, { botTasks: { repos: ["a/b", "linx-systems/clamui"] } }]);
   });
 
+  it("offers the GitHub CLI or a token kept in the Vault, and says the token is not in the config file", async () => {
+    render(settings({ enabled: true, githubSync: true }));
+    const choices = [...host.querySelectorAll<HTMLButtonElement>("button")].filter((button) => ["GitHub CLI", "Vault token"].includes(button.textContent ?? ""));
+    expect(choices.map((button) => button.textContent)).toEqual(["GitHub CLI", "Vault token"]);
+    expect(host.querySelector("[data-bot-tasks-token]"), "no token field while the CLI signs in").toBeNull();
+    await click(choices[1]!);
+    expect(sent()).toEqual([{ botTasks: { credential: "vault" } }]);
+    render(settings({ enabled: true, githubSync: true, credential: "vault" }));
+    const field = $("[data-bot-tasks-token]").textContent ?? "";
+    expect(field).toContain("Vault");
+    expect(field).toContain("never in the config file");
+    expect($("[data-bot-tasks-token-state]").textContent).toBe("No token in the Vault");
+  });
+
   it("writes the token without ever showing it, and removes it with null", async () => {
-    render(settings({ enabled: true, githubSync: true, credential: "token" }));
+    render(settings({ enabled: true, githubSync: true, credential: "vault" }));
     expect($("[data-bot-tasks-token-state]").dataset.botTasksTokenState).toBe("unset");
     const input = $<HTMLInputElement>("[data-bot-tasks-token] input");
     expect(input.type).toBe("password");
     type(input, "  ghp_secret  ");
     await click($("[data-bot-tasks-save-token]"));
     expect(input.value).toBe("");
-    render(settings({ enabled: true, githubSync: true, credential: "token", githubTokenSet: true }));
+    render(settings({ enabled: true, githubSync: true, credential: "vault", githubTokenSet: true }));
     expect($("[data-bot-tasks-token-state]").dataset.botTasksTokenState).toBe("set");
     expect(host.textContent).not.toContain("ghp_secret");
     await click($("[data-bot-tasks-clear-token]"));

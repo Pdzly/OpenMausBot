@@ -85,4 +85,49 @@ describe("BotTaskActivityList", () => {
     expect(rows()[0]!.querySelector("p.whitespace-pre-wrap")!.textContent).toBe(text);
     expect(host.querySelectorAll("a")).toHaveLength(0);
   });
+
+  it("marks history imported from GitHub and shows its original GitHub time as a date, normal entries keep the relative time", () => {
+    const original = Date.UTC(2025, 2, 14, 9, 30);
+    render([
+      { id: "1", at: original, by: { kind: "github", login: "octocat" }, type: "github_comment", text: "old note", imported: true },
+      { id: "2", at: original + 1000, by: lin, type: "github_ref", ref: { repo: "linx-systems/clamui", number: 12 } },
+    ]);
+    const [imported, linked] = rows();
+    expect(imported!.hasAttribute("data-imported")).toBe(true);
+    expect(imported!.querySelector("[data-github-badge]")!.textContent).toBe("Imported from GitHub");
+    const time = imported!.querySelector<HTMLTimeElement>("time[data-original-time]")!;
+    expect(time.dateTime).toBe(new Date(original).toISOString());
+    expect(time.textContent).toContain("2025");
+    expect(time.title).toBe(`Original time on GitHub: ${time.textContent}`);
+    expect(linked!.hasAttribute("data-imported")).toBe(false);
+    expect(linked!.querySelector("[data-github-badge]")).toBeNull();
+    expect(linked!.querySelector("time[data-original-time]")).toBeNull();
+    expect(linked!.querySelector("time")!.textContent).not.toContain("2025");
+  });
+
+  it("badges each checked claim: verified, failed as an error, not verifiable as neutral, with when and why", () => {
+    const checkedAt = Date.UTC(2026, 10, 27, 9, 0);
+    render([{
+      id: "s", at: 1, by: lin, type: "status", from: "review", to: "done", evidence: [
+        { kind: "commit", sha: "0123456789abcdef0123456789abcdef01234567", verification: { status: "verified", checkedAt } },
+        { kind: "ci_run", url: "https://github.com/linx-systems/clamui/actions/runs/42", verification: { status: "failed", checkedAt, detail: "The run failed" } },
+        { kind: "review_url", url: "https://reviews.example.com/7", verification: { status: "unverifiable", checkedAt, detail: "Not on GitHub" } },
+        { kind: "command", command: "pnpm test", exitCode: 0 },
+      ],
+    }]);
+    const proof = [...host.querySelectorAll<HTMLLIElement>("[data-evidence]")];
+    const badge = (item: HTMLLIElement) => item.querySelector<HTMLElement>("[data-verification-badge]");
+    expect(proof.map((item) => badge(item)?.textContent ?? null)).toEqual(["Verified", "Failed", "Not verifiable", null]);
+    expect(badge(proof[1]!)!.className).toContain("text-danger");
+    expect(badge(proof[2]!)!.className).not.toContain("danger");
+    const line = (item: HTMLLIElement) => item.querySelector<HTMLElement>("[data-verification-line]");
+    expect(line(proof[0]!)!.textContent).toMatch(/^Checked .*2026/);
+    expect(line(proof[1]!)!.textContent).toMatch(/^The run failed · Checked /);
+    expect(line(proof[1]!)!.className).toContain("text-danger");
+    expect(line(proof[2]!)!.textContent).toMatch(/^Not on GitHub · Checked /);
+    expect(badge(proof[1]!)!.title).toContain("The run failed");
+    expect(badge(proof[1]!)!.title).toContain("Checked ");
+    expect(line(proof[3]!), "older proof without a check shows no badge and no line").toBeNull();
+    expect(proof[3]!.textContent).toBe("pnpm testexit 0");
+  });
 });
